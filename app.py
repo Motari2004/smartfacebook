@@ -86,7 +86,7 @@ else:
     
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
-GEMINI_MODEL = "gemini-3.5-flash-lite"
+GEMINI_MODEL = "gemini-3.1-flash-lite"  # Use a valid model
 _gemini_key_index = 0
 
 sessions = {}  # in-memory session cache
