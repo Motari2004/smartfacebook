@@ -1496,7 +1496,6 @@ def tool_list_vault(limit=20, offset=0):
                 "handler_handle": r['handler_handle'],
                 "notes": r['notes'],
             })
-        # ✅ IMPORTANT: Return count in the result
         return {"success": True, "vault": vault, "count": total}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -2487,10 +2486,7 @@ def execute_tool(name, args, session_id=None):
 
 
 SYSTEM_PROMPT = """You are the AI for Bluesky AI Vault → Facebook.
-CRITICAL - When responding to "how many posts in vault" or similar questions:
-1. Call list_vault first
-2. Use the tool result to respond with a friendly message like "📦 You have X posts in your vault" 
-   followed by a brief summary of the posts with their IDs.
+
 RULES:
 - Source platform: Bluesky (login, fetch posts).
 - Destination platform: Facebook only (post, schedule, auto-pilot via Zernio).
@@ -2509,48 +2505,17 @@ Be concise. Timezone for schedules is Africa/Nairobi (GMT+3).
 
 
 def format_tool_summary(tool_results):
-    """Human-readable summary with proper vault formatting."""
     parts = []
     for tr in tool_results:
         name = tr.get('name')
         r = tr.get('result') or {}
-        
         if not r.get('success'):
             parts.append(f"❌ {name}: {r.get('error') or r.get('message') or 'failed'}")
             continue
-        
-        # Handle list_vault specifically
-        if name == 'list_vault':
-            items = r.get('vault') or []
-            count = r.get('count') or len(items)
-            
-            if count == 0:
-                parts.append("📦 Your vault is empty right now.")
-            else:
-                lines = [f"📦 Vault has **{count}** post(s):"]
-                for i, item in enumerate(items[:5], 1):
-                    text = (item.get('text') or '').strip()
-                    if len(text) > 70:
-                        text = text[:70] + "..."
-                    if not text:
-                        text = "(image only)"
-                    img_count = len(item.get('images') or [])
-                    img_text = f" 📸{img_count}" if img_count > 0 else ""
-                    author = f" @{item.get('author', '?')}"
-                    lines.append(f"  {i}. {text}{img_text}{author}")
-                
-                if len(items) > 5:
-                    lines.append(f"  ...and {len(items) - 5} more")
-                
-                parts.append("\n".join(lines))
-            continue
-        
-        # Handle other tools
         if r.get('message'):
             parts.append(r['message'])
             continue
         parts.append(f"{name}: OK")
-    
     return "\n".join(parts) if parts else "Done."
 
 
