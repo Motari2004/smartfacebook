@@ -2886,13 +2886,36 @@ VAULT MANAGEMENT COMMANDS:
 - "post id 5" → Call post_now(vault_id=5)
 - "post 3 from vault" → Call post_vault_batch(count=3)
 
+===========================================
+CRITICAL - MULTIPLE ACCOUNTS FLOW:
+===========================================
+When the user wants to POST something (post_now, post_unposted, post_vault_batch):
+
+STEP 1: Check if the user specified an account:
+- "post id 5 to ScorpioGuardian" → use account_username="ScorpioGuardian"
+- "post unposted to Daily Wisdom" → use account_username="Daily Wisdom"
+
+STEP 2: If NO account was specified:
+- Call list_accounts() first to check how many accounts exist
+- If ONLY 1 account → use it automatically, mention: "Posting to [account_name]"
+- If MULTIPLE accounts → ASK the user: "You have [N] Facebook accounts: [list names]. Which account would you like to post to?"
+
+STEP 3: Wait for the user's response before posting.
+
+ACCOUNT MANAGEMENT:
+- "list accounts" or "how many accounts" → Call list_accounts()
+- "which account" or "what accounts" → Call list_accounts()
+
+===========================================
 CRITICAL - When responding to vault questions:
+===========================================
 1. Call the appropriate tool first
 2. Use the tool result to respond with a friendly summary
 3. Show count, status, and list items with their IDs
 4. For deletion, ALWAYS confirm with the user first (especially for "delete all")
 5. When showing vault items, include their status icons:
    ✅ = posted, ⏳ = scheduled, ⬜ = unposted
+6. For posting, always mention which account was used (e.g., "Posted to ScorpioGuardian")
 
 RULES:
 - Source platform: Bluesky (login, fetch posts).
@@ -2904,7 +2927,7 @@ You help the user:
 - Login to Bluesky
 - Fetch posts from Bluesky handles
 - Save them to a vault
-- Post vault items to Facebook
+- Post vault items to Facebook (ask which account if multiple)
 - Auto-pilot: watch a Bluesky account and cross-post new media to Facebook
 - Manage vault: list by status, delete items, post unposted items
 
