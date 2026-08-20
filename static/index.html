@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
     <title>Bluesky AI Vault → Facebook</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet"/>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"/>
@@ -21,16 +21,23 @@
             --warning: #f59e0b;
             --radius: 14px;
             --radius-sm: 10px;
+            --safe-bottom: env(safe-area-inset-bottom, 0px);
         }
         * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body {
+            height: 100%;
+            height: 100dvh;
+        }
         body {
             font-family: 'Inter', system-ui, sans-serif;
             background: var(--bg);
             color: var(--text);
-            height: 100vh;
             display: flex;
             overflow: hidden;
+            -webkit-tap-highlight-color: transparent;
         }
+
+        /* ===== SIDEBAR ===== */
         .sidebar {
             width: 280px;
             background: var(--card);
@@ -42,15 +49,55 @@
             overflow-x: hidden;
             scrollbar-width: thin;
             scrollbar-color: #333 transparent;
+            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            z-index: 100;
+            position: relative;
         }
         .sidebar::-webkit-scrollbar { width: 5px; }
         .sidebar::-webkit-scrollbar-thumb { background: #333; border-radius: 10px; }
+
+        /* ===== SIDEBAR OVERLAY + TOGGLE ===== */
+        .sidebar-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.6);
+            z-index: 99;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+        .sidebar-overlay.active {
+            display: block;
+            opacity: 1;
+        }
+        .sidebar-toggle {
+            display: none;
+            position: fixed;
+            top: 12px;
+            left: 12px;
+            z-index: 101;
+            background: var(--card);
+            border: 1px solid var(--border);
+            color: var(--text);
+            width: 44px;
+            height: 44px;
+            border-radius: 12px;
+            font-size: 18px;
+            cursor: pointer;
+            transition: all 0.2s;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+        }
+        .sidebar-toggle:active { transform: scale(0.95); }
+
         .logo {
             display: flex;
             align-items: center;
             gap: 12px;
             padding: 20px 18px;
             border-bottom: 1px solid var(--border);
+            flex-shrink: 0;
         }
         .logo i { font-size: 24px; color: var(--accent); }
         .logo h1 { font-size: 16px; font-weight: 700; }
@@ -93,23 +140,15 @@
             flex-shrink: 0;
         }
         .sidebar-actions button { width: 100%; justify-content: center; }
-        .hints {
-            margin-top: auto;
-            padding: 16px;
-            border-top: 1px solid var(--border);
-            font-size: 12px;
-            color: var(--text-muted);
-            line-height: 1.5;
+
+        .main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            height: 100%;
+            height: 100dvh;
         }
-        .hints strong { color: var(--text-secondary); display: block; margin-bottom: 6px; }
-        .hints code {
-            background: rgba(255,255,255,0.05);
-            padding: 1px 5px;
-            border-radius: 4px;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 11px;
-        }
-        .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
         .chat-header {
             padding: 16px 24px;
             border-bottom: 1px solid var(--border);
@@ -117,9 +156,12 @@
             align-items: center;
             gap: 12px;
             background: var(--card);
+            flex-shrink: 0;
+            min-height: 56px;
         }
         .chat-header h2 { font-size: 15px; font-weight: 600; }
         .chat-header .sub { font-size: 12px; color: var(--text-muted); }
+
         .messages {
             flex: 1;
             overflow-y: auto;
@@ -129,9 +171,12 @@
             gap: 16px;
             scrollbar-width: thin;
             scrollbar-color: #333 transparent;
+            -webkit-overflow-scrolling: touch;
+            overscroll-behavior: contain;
         }
         .messages::-webkit-scrollbar { width: 6px; }
         .messages::-webkit-scrollbar-thumb { background: #333; border-radius: 10px; }
+
         .msg {
             max-width: 720px;
             display: flex;
@@ -175,6 +220,11 @@
             margin-bottom: 8px;
             font-weight: 600;
         }
+        .msg .avatar.ai-avatar {
+            background: linear-gradient(135deg, #1877f2, #8b5cf6);
+            box-shadow: 0 0 20px rgba(24,119,242,0.2);
+        }
+
         .typing {
             display: none;
             align-items: center;
@@ -198,59 +248,16 @@
             0%, 80%, 100% { transform: translateY(0); }
             40% { transform: translateY(-5px); }
         }
+
+        /* ===== COMPOSER (lifted + curved) ===== */
         .composer {
-            padding: 16px 24px 24px;
+            padding: 14px 20px 20px;
+            padding-bottom: calc(18px + var(--safe-bottom));
             border-top: 1px solid var(--border);
             background: var(--card);
+            flex-shrink: 0;
             position: relative;
         }
-        .composer-inner {
-            display: flex;
-            gap: 10px;
-            align-items: center;
-            background: var(--bg);
-            border: 1.5px solid var(--border);
-            border-radius: 14px;
-            padding: 4px 4px 4px 6px;
-            transition: all 0.3s ease;
-            min-height: 48px;
-        }
-        .composer-inner:focus-within {
-            border-color: var(--accent);
-            box-shadow: 0 0 0 4px rgba(24,119,242,0.06);
-        }
-        .composer textarea {
-            flex: 1;
-            width: 100%;
-            background: transparent;
-            border: none;
-            color: var(--text);
-            font-family: inherit;
-            font-size: 14px;
-            resize: none;
-            max-height: 140px;
-            min-height: 22px;
-            line-height: 1.6;
-            outline: none;
-            padding: 8px 0;
-        }
-        .composer button.send {
-            background: linear-gradient(135deg, #1877f2, #0d65d9);
-            color: #fff;
-            border: none;
-            border-radius: 10px;
-            width: 42px; height: 42px;
-            display: flex; align-items: center; justify-content: center;
-            cursor: pointer;
-            flex-shrink: 0;
-            transition: all 0.3s ease;
-            box-shadow: 0 4px 15px rgba(24,119,242,0.2);
-        }
-        .composer button.send:hover:not(:disabled) {
-            transform: translateY(-2px) scale(1.02);
-            box-shadow: 0 6px 25px rgba(24,119,242,0.35);
-        }
-        .composer button.send:disabled { opacity: 0.3; cursor: not-allowed; box-shadow: none; }
         .quick-row {
             display: flex;
             gap: 8px;
@@ -267,12 +274,72 @@
             cursor: pointer;
             font-family: inherit;
             transition: all 0.25s ease;
+            touch-action: manipulation;
+            min-height: 32px;
         }
         .quick-btn:hover {
             border-color: var(--accent);
             color: var(--accent);
             background: rgba(24,119,242,0.08);
         }
+        .quick-btn:active { transform: scale(0.96); }
+
+        .composer-inner {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            background: var(--bg);
+            border: 1.5px solid var(--border);
+            border-radius: 24px;          /* curved */
+            padding: 6px 6px 6px 14px;
+            transition: all 0.3s ease;
+            min-height: 50px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.25);
+        }
+        .composer-inner:focus-within {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 4px rgba(24,119,242,0.08), 0 4px 20px rgba(0,0,0,0.3);
+        }
+        .composer textarea {
+            flex: 1;
+            width: 100%;
+            background: transparent;
+            border: none;
+            color: var(--text);
+            font-family: inherit;
+            font-size: 15px;
+            resize: none;
+            max-height: 140px;
+            min-height: 22px;
+            line-height: 1.5;
+            outline: none;
+            padding: 8px 4px;
+            -webkit-appearance: none;
+            min-width: 0;
+        }
+        .composer button.send {
+            background: linear-gradient(135deg, #1877f2, #0d65d9);
+            color: #fff;
+            border: none;
+            border-radius: 50%;           /* circular */
+            width: 42px;
+            height: 42px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            flex-shrink: 0;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(24,119,242,0.25);
+            touch-action: manipulation;
+        }
+        .composer button.send:hover:not(:disabled) {
+            transform: translateY(-2px) scale(1.04);
+            box-shadow: 0 6px 25px rgba(24,119,242,0.4);
+        }
+        .composer button.send:active:not(:disabled) { transform: scale(0.92); }
+        .composer button.send:disabled { opacity: 0.3; cursor: not-allowed; box-shadow: none; }
+
         .btn {
             display: inline-flex;
             align-items: center;
@@ -285,6 +352,8 @@
             font-family: inherit;
             cursor: pointer;
             transition: all 0.2s;
+            touch-action: manipulation;
+            min-height: 40px;
         }
         .btn-secondary {
             background: var(--bg);
@@ -292,6 +361,8 @@
             border: 1px solid var(--border);
         }
         .btn-secondary:hover { background: var(--border); color: var(--text); }
+        .btn-secondary:active { transform: scale(0.97); }
+
         .empty-state {
             flex: 1;
             display: flex;
@@ -300,11 +371,12 @@
             justify-content: center;
             color: var(--text-muted);
             text-align: center;
-            padding: 40px;
+            padding: 40px 20px;
         }
         .empty-state i { font-size: 42px; margin-bottom: 16px; opacity: 0.35; }
         .empty-state h3 { color: var(--text-secondary); margin-bottom: 8px; font-weight: 600; }
         .empty-state p { font-size: 14px; max-width: 360px; line-height: 1.5; }
+
         .live-dot {
             display: inline-block;
             width: 9px; height: 9px;
@@ -323,6 +395,7 @@
             70% { box-shadow: 0 0 0 8px rgba(34,197,94,0); }
             100% { box-shadow: 0 0 0 0 rgba(34,197,94,0); }
         }
+
         .auto-banner {
             margin: 0 16px 12px;
             padding: 14px;
@@ -356,6 +429,7 @@
             border: 1px solid var(--border);
             padding: 2px 8px;
             border-radius: 999px;
+            margin-left: auto;
         }
         .auto-banner.running .auto-count {
             color: var(--success);
@@ -402,6 +476,7 @@
             font-family: 'JetBrains Mono', monospace;
         }
         .pipe-empty { color: var(--text-muted); font-size: 11px; padding: 6px 4px; }
+
         .header-auto {
             margin-left: auto;
             display: flex;
@@ -414,19 +489,17 @@
             border: 1px solid var(--border);
             background: var(--bg);
             flex-shrink: 0;
+            white-space: nowrap;
         }
         .header-auto.on {
             border-color: rgba(34,197,94,0.4);
             color: var(--success);
             background: rgba(34,197,94,0.08);
         }
-        .msg .avatar.ai-avatar {
-            background: linear-gradient(135deg, #1877f2, #8b5cf6);
-            box-shadow: 0 0 20px rgba(24,119,242,0.2);
-        }
+
         .toast {
             position: fixed;
-            bottom: 100px;
+            bottom: calc(110px + var(--safe-bottom));
             left: 50%;
             transform: translateX(-50%);
             padding: 12px 24px;
@@ -445,6 +518,7 @@
             from { opacity: 0; transform: translateX(-50%) translateY(20px); }
             to { opacity: 1; transform: translateX(-50%) translateY(0); }
         }
+
         .post-images {
             display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px;
         }
@@ -462,23 +536,146 @@
         .media-preview {
             background: rgba(255,255,255,0.03);
             border: 1px solid var(--border);
-            border-radius: 10px;
+            border-radius: 12px;
             padding: 10px 12px;
             margin-top: 10px;
             display: flex;
             align-items: center;
             gap: 12px;
         }
+
+        /* ===== RESPONSIVE ===== */
         @media (max-width: 768px) {
-            .sidebar { display: none; }
-            .messages { padding: 16px; }
-            .composer { padding: 12px 16px 16px; }
-            .msg { max-width: 100%; }
+            .sidebar-toggle { display: flex !important; }
+
+            .sidebar {
+                position: fixed;
+                top: 0; left: 0; bottom: 0;
+                width: 290px;
+                transform: translateX(-100%);
+                box-shadow: 4px 0 30px rgba(0,0,0,0.6);
+                z-index: 100;
+            }
+            .sidebar.open { transform: translateX(0); }
+            .sidebar-overlay.active { display: block; }
+
+            .chat-header {
+                padding: 12px 16px;
+                padding-left: 60px;
+                min-height: 52px;
+            }
+            .chat-header h2 { font-size: 14px; }
+            .chat-header .sub { display: none; }
+            .header-auto { font-size: 11px; padding: 4px 10px; }
+
+            .messages { padding: 14px 12px 8px; gap: 12px; }
+            .msg { max-width: 95%; }
+            .msg .bubble { font-size: 13px; padding: 10px 13px; }
+            .msg .avatar { width: 30px; height: 30px; font-size: 13px; }
+
+            /* Lifted + curved composer */
+            .composer {
+                padding: 10px 12px 18px;
+                padding-bottom: calc(20px + var(--safe-bottom));
+                background: linear-gradient(180deg, transparent 0%, var(--card) 12%);
+            }
+            .quick-btn {
+                font-size: 10px;
+                padding: 5px 11px;
+                min-height: 32px;
+                border-radius: 18px;
+            }
+            .composer-inner {
+                min-height: 50px;
+                border-radius: 26px;
+                padding: 6px 6px 6px 16px;
+            }
+            .composer textarea {
+                font-size: 16px;          /* prevents iOS zoom */
+                padding: 8px 4px;
+            }
+            .composer button.send {
+                width: 42px;
+                height: 42px;
+            }
+
+            .empty-state i { font-size: 32px; }
+            .empty-state h3 { font-size: 15px; }
+            .empty-state p { font-size: 13px; }
+
+            .status-card { margin: 12px; padding: 12px; font-size: 12px; }
+            .sidebar-actions button { font-size: 12px; padding: 8px 12px; min-height: 38px; }
+            .auto-banner { margin: 0 12px 10px; padding: 12px; min-height: 70px; font-size: 11px; }
+
+            .toast { bottom: calc(115px + var(--safe-bottom)); }
+            .post-images .image-wrapper { max-width: 140px; }
+            .post-images .image-wrapper img { max-height: 140px; }
+        }
+
+        @media (max-width: 480px) {
+            .sidebar { width: 270px; }
+            .sidebar-toggle {
+                top: 8px; left: 8px;
+                width: 38px; height: 38px;
+                font-size: 15px;
+            }
+            .chat-header {
+                padding: 10px 12px;
+                padding-left: 54px;
+                min-height: 48px;
+            }
+            .chat-header h2 { font-size: 13px; }
+            .messages { padding: 10px 10px 6px; gap: 10px; }
+            .msg .bubble { font-size: 13px; padding: 9px 12px; }
+            .msg .avatar { width: 26px; height: 26px; font-size: 12px; }
+
+            .composer {
+                padding: 8px 10px 16px;
+                padding-bottom: calc(18px + var(--safe-bottom));
+            }
+            .composer-inner {
+                min-height: 48px;
+                border-radius: 24px;
+                padding: 5px 5px 5px 14px;
+            }
+            .composer textarea {
+                font-size: 16px;
+                min-height: 20px;
+            }
+            .composer button.send {
+                width: 40px;
+                height: 40px;
+            }
+            .quick-row { gap: 5px; margin-bottom: 8px; }
+            .quick-btn {
+                font-size: 9px;
+                padding: 4px 9px;
+                min-height: 28px;
+            }
+            .empty-state { padding: 24px 14px; }
+            .empty-state i { font-size: 28px; }
+            .empty-state h3 { font-size: 14px; }
+            .empty-state p { font-size: 12px; }
+            .toast {
+                font-size: 12px;
+                padding: 10px 18px;
+                bottom: calc(105px + var(--safe-bottom));
+            }
+            .media-preview {
+                flex-wrap: wrap;
+                gap: 8px;
+            }
         }
     </style>
 </head>
 <body>
-    <aside class="sidebar">
+    <!-- Sidebar toggle (mobile) -->
+    <button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar">
+        <i class="fas fa-bars"></i>
+    </button>
+    <div class="sidebar-overlay" id="sidebarOverlay"></div>
+
+    <aside class="sidebar" id="sidebar">
         <div class="logo">
             <i class="fab fa-facebook"></i>
             <h1>AI Vault</h1>
@@ -512,6 +709,7 @@
             </button>
         </div>
     </aside>
+
     <main class="main">
         <div class="chat-header">
             <div>
@@ -558,7 +756,7 @@
                     <span id="mediaFileName" style="display:block;font-size:12px;font-weight:500;"></span>
                     <span id="mediaFileSize" style="font-size:10px;color:var(--text-muted);"></span>
                 </div>
-                <div style="display:flex;gap:4px;">
+                <div style="display:flex;gap:4px;flex-wrap:wrap;">
                     <button onclick="postImageNow()" style="background:var(--accent);color:#fff;border:none;padding:4px 12px;border-radius:6px;font-size:10px;cursor:pointer;">Post Now</button>
                     <button onclick="scheduleImage()" style="background:transparent;color:var(--text-secondary);border:1px solid var(--border);padding:4px 12px;border-radius:6px;font-size:10px;cursor:pointer;">Schedule</button>
                     <button onclick="saveToVault()" style="background:transparent;color:var(--warning);border:1px solid var(--border);padding:4px 12px;border-radius:6px;font-size:10px;cursor:pointer;">Save</button>
@@ -566,6 +764,7 @@
             </div>
         </div>
     </main>
+
 <script>
 const API = window.location.origin;
 let history = [];
@@ -580,6 +779,27 @@ const typingEl = $('typing');
 const emptyState = $('emptyState');
 let uploadedMedia = null;
 
+// ===== SIDEBAR TOGGLE =====
+const sidebar = $('sidebar');
+const overlay = $('sidebarOverlay');
+const toggleBtn = $('sidebarToggle');
+function toggleSidebar() {
+    sidebar.classList.toggle('open');
+    overlay.classList.toggle('active');
+    toggleBtn.innerHTML = sidebar.classList.contains('open')
+        ? '<i class="fas fa-times"></i>'
+        : '<i class="fas fa-bars"></i>';
+}
+toggleBtn.addEventListener('click', toggleSidebar);
+overlay.addEventListener('click', toggleSidebar);
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && sidebar.classList.contains('open')) toggleSidebar();
+});
+window.addEventListener('resize', () => {
+    if (window.innerWidth > 768 && sidebar.classList.contains('open')) toggleSidebar();
+});
+
+// ===== INPUT =====
 inputEl.addEventListener('input', () => {
     inputEl.style.height = 'auto';
     inputEl.style.height = Math.min(inputEl.scrollHeight, 140) + 'px';
@@ -591,6 +811,7 @@ inputEl.addEventListener('keydown', e => {
         if (!sendBtn.disabled) sendMessage();
     }
 });
+setTimeout(() => inputEl.focus(), 100);
 
 function toast(message, type = 'info') {
     const existing = document.querySelector('.toast');
