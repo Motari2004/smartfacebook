@@ -1,7 +1,7 @@
 flask==2.3.3
 flask-cors==4.0.0
 psycopg2-binary==2.9.9
-atproto==0.0.46
+atproto>=0.0.55
 Pillow==10.1.0
 python-dotenv==1.0.0
 pytz==2023.3.post1
