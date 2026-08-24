@@ -1714,11 +1714,18 @@ def tool_fetch_posts(session_id, actor, limit=15, media_only=True, include_repos
         return {"success": False, "error": str(e)}
 
 
-def tool_add_to_vault(posts, handler_handle=None):
+def tool_add_to_vault(posts, handler_handle=None, retag=False):
+    """
+    Save posts to vault. URI is unique globally.
+    retag=True (master-fetch): if URI already exists under another handler_handle,
+    update handler_handle to this pipeline so the niche reserve can use it.
+    """
     if not posts:
         return {"success": False, "error": "No posts to save"}
     saved = 0
     skipped = 0
+    retagged = 0
+    hh = handler_handle
     try:
         conn = get_db_connection()
         if not conn:
@@ -1728,38 +1735,105 @@ def tool_add_to_vault(posts, handler_handle=None):
             uri = p.get('uri')
             if not uri:
                 continue
+            tag = hh or p.get('author')
             try:
-                cur.execute("""
-                    INSERT INTO vault (uri, author, display_name, text, images, likes, reposts, replies, created_at, handler_handle)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (uri) DO NOTHING
-                """, (
-                    uri,
-                    p.get('author') or 'unknown',
-                    p.get('display_name'),
-                    p.get('text'),
-                    Json(p.get('images') or []),
-                    int(p.get('likes') or 0),
-                    int(p.get('reposts') or 0),
-                    int(p.get('replies') or 0),
-                    p.get('created_at'),
-                    handler_handle or p.get('author'),
-                ))
-                if cur.rowcount:
-                    saved += 1
+                if retag and tag:
+                    # Insert or claim for this pipeline
+                    cur.execute("""
+                        INSERT INTO vault (uri, author, display_name, text, images, likes, reposts, replies, created_at, handler_handle)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (uri) DO UPDATE SET
+                            handler_handle = EXCLUDED.handler_handle,
+                            images = COALESCE(EXCLUDED.images, vault.images),
+                            text = COALESCE(NULLIF(EXCLUDED.text, ''), vault.text),
+                            likes = GREATEST(vault.likes, EXCLUDED.likes),
+                            reposts = GREATEST(vault.reposts, EXCLUDED.reposts),
+                            replies = GREATEST(vault.replies, EXCLUDED.replies)
+                        WHERE vault.handler_handle IS DISTINCT FROM EXCLUDED.handler_handle
+                           OR vault.images IS NULL
+                    """, (
+                        uri,
+                        p.get('author') or 'unknown',
+                        p.get('display_name'),
+                        p.get('text'),
+                        Json(p.get('images') or []),
+                        int(p.get('likes') or 0),
+                        int(p.get('reposts') or 0),
+                        int(p.get('replies') or 0),
+                        p.get('created_at'),
+                        tag,
+                    ))
+                    if cur.rowcount:
+                        # Could be insert or update — distinguish
+                        cur.execute(
+                            "SELECT handler_handle FROM vault WHERE uri = %s",
+                            (uri,),
+                        )
+                        row = cur.fetchone()
+                        # rowcount 1 on both insert and update; check if was pure skip
+                        saved += 1  # count as acquired for this niche
+                        # We'll refine: if already had this handler, it's skip
+                    else:
+                        # Already tagged for this pipeline
+                        skipped += 1
                 else:
-                    skipped += 1
+                    cur.execute("""
+                        INSERT INTO vault (uri, author, display_name, text, images, likes, reposts, replies, created_at, handler_handle)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (uri) DO NOTHING
+                    """, (
+                        uri,
+                        p.get('author') or 'unknown',
+                        p.get('display_name'),
+                        p.get('text'),
+                        Json(p.get('images') or []),
+                        int(p.get('likes') or 0),
+                        int(p.get('reposts') or 0),
+                        int(p.get('replies') or 0),
+                        p.get('created_at'),
+                        tag,
+                    ))
+                    if cur.rowcount:
+                        saved += 1
+                    else:
+                        skipped += 1
             except Exception as e:
                 print(f"vault insert: {e}")
                 skipped += 1
         conn.commit()
+
+        # Recount retagged vs new for clearer message when retag=True
+        if retag and tag and posts:
+            try:
+                uris = [p.get('uri') for p in posts if p.get('uri')]
+                cur.execute(
+                    """
+                    SELECT COUNT(*) FROM vault
+                    WHERE handler_handle = %s AND uri = ANY(%s)
+                    """,
+                    (tag, uris),
+                )
+                in_pipeline = cur.fetchone()[0]
+            except Exception:
+                in_pipeline = saved
+        else:
+            in_pipeline = saved
+
         cur.close()
         conn.close()
+        msg = f"Saved {saved} to vault ({skipped} already present)"
+        if retag:
+            msg = (
+                f"Pipeline «{tag}»: {in_pipeline} posts available in reserve "
+                f"(new/claimed {saved}, already same-pipeline {skipped})"
+            )
         return {
             "success": True,
             "saved": saved,
             "skipped": skipped,
-            "message": f"Saved {saved} to vault ({skipped} already present)",
+            "retagged": retagged,
+            "in_pipeline": in_pipeline if retag else saved,
+            "message": msg,
         }
     except Exception as e:
         traceback.print_exc()
@@ -2659,10 +2733,35 @@ def start_auto_pilot():
 # MASTER FETCH (reserve)
 # ============================================================
 
-def tool_master_fetch_niche(name=None, limit_per_source=50, max_pages=5):
+def _vault_known_uris(handler_handle=None):
+    """URIs already in vault (optionally for one pipeline). Used to skip on refill."""
+    known = set()
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return known
+        cur = conn.cursor()
+        if handler_handle:
+            cur.execute("SELECT uri FROM vault WHERE handler_handle = %s", (handler_handle,))
+        else:
+            cur.execute("SELECT uri FROM vault")
+        for row in cur.fetchall():
+            if row and row[0]:
+                known.add(row[0])
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"vault known uris: {e}")
+    return known
+
+
+def tool_master_fetch_niche(name=None, limit_per_source=80, max_pages=10):
     """
-    Fill niche reserve from Bluesky sources with pagination.
-    limit_per_source = target media posts to collect per source (walks pages until filled or max_pages).
+    Fill niche reserve from Bluesky sources.
+
+    Each click aims for `limit_per_source` **NEW** media posts (not already in vault).
+    Already-fetched URIs are skipped; pagination continues until the new quota is
+    met or pages/cursor run out — so refill is not stuck on the first 20 again.
     """
     if not name:
         return {"success": False, "error": "name required"}
@@ -2679,62 +2778,117 @@ def tool_master_fetch_niche(name=None, limit_per_source=50, max_pages=5):
     if not client:
         return {"success": False, "error": "No Bluesky session / master account"}
 
-    target = max(10, int(limit_per_source or 50))
-    pages = max(1, min(int(max_pages or 5), 15))
-    # Scan enough raw items to find media (many accounts post text-only / video)
-    scan_limit = min(500, max(target * 4, pages * 50))
+    # Per-click NEW posts target (ignore ones we already have)
+    target_new = max(10, int(limit_per_source or 80))
+    pages = max(1, min(int(max_pages or 10), 25))
+    media_only = bool(cfg.get('media_only', True))
+
+    # Skip anything already in vault (global) so we only count truly new inserts
+    known = _vault_known_uris(handler_handle=None)
+    print(f"📦 vault already has {len(known)} URIs — will skip those while filling «{name}»")
 
     all_posts = []
     per_source = {}
+
     for src in sources:
         actor = src.lstrip('@')
         if '.' not in actor:
             actor = actor + '.bsky.social'
-        collected = 0
+
+        new_for_source = 0
+        skipped_known = 0
+        scanned = 0
+        cursor = None
+
         try:
-            # Paginate until we have enough *media* posts or pages run out
-            raw = _raw_get_author_feed(client, actor, limit=scan_limit, max_pages=pages)
-            for p in raw:
-                images = p.get('images') or []
-                if cfg.get('media_only', True) and not images:
-                    continue
-                if not p.get('uri'):
-                    continue
-                all_posts.append({
-                    "uri": p.get('uri'),
-                    "author": p.get('author') or actor,
-                    "display_name": p.get('display_name'),
-                    "text": p.get('text') or '',
-                    "images": images,
-                    "likes": p.get('likes') or 0,
-                    "reposts": p.get('reposts') or 0,
-                    "replies": p.get('replies') or 0,
-                    "created_at": p.get('created_at'),
-                })
-                collected += 1
-                if collected >= target:
+            for page_i in range(pages):
+                if new_for_source >= target_new:
                     break
-            per_source[actor] = collected
-            print(f"📥 master-fetch @{actor}: {collected} media posts (scanned {len(raw)} over ≤{pages} pages)")
+                try:
+                    batch, cursor = _http_get_author_feed_page(
+                        client, actor, limit=100, cursor=cursor
+                    )
+                except Exception as e:
+                    print(f"master-fetch page {page_i + 1} @{actor}: {e}")
+                    break
+
+                if not batch:
+                    break
+
+                scanned += len(batch)
+                print(
+                    f"📄 @{actor} page {page_i + 1}: +{len(batch)} items "
+                    f"(new {new_for_source}/{target_new}, skipped_known {skipped_known}, "
+                    f"cursor={'yes' if cursor else 'end'})"
+                )
+
+                for p in batch:
+                    uri = p.get('uri')
+                    if not uri:
+                        continue
+                    images = p.get('images') or []
+                    if media_only and not images:
+                        continue
+                    if uri in known:
+                        skipped_known += 1
+                        continue
+                    # New post for this fill
+                    known.add(uri)
+                    all_posts.append({
+                        "uri": uri,
+                        "author": p.get('author') or actor,
+                        "display_name": p.get('display_name'),
+                        "text": p.get('text') or '',
+                        "images": images,
+                        "likes": p.get('likes') or 0,
+                        "reposts": p.get('reposts') or 0,
+                        "replies": p.get('replies') or 0,
+                        "created_at": p.get('created_at'),
+                    })
+                    new_for_source += 1
+                    if new_for_source >= target_new:
+                        break
+
+                if not cursor:
+                    break
+
+            per_source[actor] = {
+                "new": new_for_source,
+                "skipped_known": skipped_known,
+                "scanned": scanned,
+            }
+            print(
+                f"📥 master-fetch @{actor}: {new_for_source} NEW media "
+                f"(scanned {scanned}, already-had {skipped_known})"
+            )
         except Exception as e:
             print(f"master fetch {src}: {e}")
-            per_source[actor] = 0
+            per_source[actor] = {"new": 0, "error": str(e)}
 
-    result = tool_add_to_vault(all_posts, handler_handle=name)
-    detail = ", ".join(f"@{a}: {n}" for a, n in per_source.items())
+    result = tool_add_to_vault(all_posts, handler_handle=name, retag=False)
+    detail_parts = []
+    for a, info in per_source.items():
+        if isinstance(info, dict):
+            detail_parts.append(f"@{a}: +{info.get('new', 0)} new")
+        else:
+            detail_parts.append(f"@{a}: {info}")
+    detail = ", ".join(detail_parts)
+    saved = result.get('saved', 0)
+    skipped = result.get('skipped', 0)
     return {
         "success": True,
-        "saved": result.get('saved', 0),
-        "skipped": result.get('skipped', 0),
+        "saved": saved,
+        "skipped": skipped,
+        "new_candidates": len(all_posts),
         "per_source": per_source,
         "message": (
-            f"Reserve for '{name}': saved {result.get('saved', 0)} "
-            f"(skipped {result.get('skipped', 0)}) · {detail}"
+            f"Reserve for '{name}': +{saved} new "
+            f"(dup insert skips {skipped}) · {detail}"
         ),
     }
 
 
-def tool_master_fetch_all_niches(limit_per_source=50, max_pages=5):
+def tool_master_fetch_all_niches(limit_per_source=80, max_pages=8):
     configs = _list_auto_configs()
     if not configs:
         return {"success": False, "error": "No pipelines configured"}
@@ -3639,8 +3793,8 @@ def api_auto_remove():
 def api_master_fetch_niche():
     data = request.json or {}
     name = data.get('name')
-    limit_per_source = int(data.get('limit_per_source', 50))
-    max_pages = int(data.get('max_pages', 5))
+    limit_per_source = int(data.get('limit_per_source', 80))
+    max_pages = int(data.get('max_pages', 8))
     result = tool_master_fetch_niche(
         name=name,
         limit_per_source=limit_per_source,
@@ -3652,8 +3806,8 @@ def api_master_fetch_niche():
 @app.route('/api/niche/master-fetch-all', methods=['POST'])
 def api_master_fetch_all():
     data = request.json or {}
-    limit_per_source = int(data.get('limit_per_source', 50))
-    max_pages = int(data.get('max_pages', 5))
+    limit_per_source = int(data.get('limit_per_source', 80))
+    max_pages = int(data.get('max_pages', 8))
     result = tool_master_fetch_all_niches(
         limit_per_source=limit_per_source,
         max_pages=max_pages,
