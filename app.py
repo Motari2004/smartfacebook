@@ -1973,6 +1973,12 @@ def tool_list_vault_by_status(status='all', limit=50, pipeline=None, handler_han
 
         sql_where = ("WHERE " + " AND ".join(where)) if where else ""
         cur.execute(
+            f"SELECT COUNT(*) AS cnt FROM vault v {sql_where}",
+            params,
+        )
+        total = int(cur.fetchone()['cnt'] or 0)
+
+        cur.execute(
             f"SELECT v.* FROM vault v {sql_where} ORDER BY v.saved_at DESC LIMIT %s",
             params + [limit],
         )
@@ -1991,13 +1997,18 @@ def tool_list_vault_by_status(status='all', limit=50, pipeline=None, handler_han
             label_bits.append(f"«{hh}»")
         label_bits.append(status)
         label = "Vault " + " · ".join(label_bits)
+        # Short count-first line for "how many" questions
+        count_line = f"📊 {label}: **{total}** posts"
+        if total > len(rows):
+            count_line += f" (showing {len(rows)} most recent)"
         return {
             "success": True,
             "vault": rows,
-            "count": len(rows),
+            "count": total,
+            "showing": len(rows),
             "status": status,
             "pipeline": hh,
-            "message": _format_vault_list_message(rows, len(rows), label),
+            "message": count_line + "\n" + _format_vault_list_message(rows, total, label),
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -3390,10 +3401,10 @@ PIPELINE SETUP:
 
 VAULT / RESERVE:
 - "list vault" → list_vault()
-- "show wildlife vault" or "posts in wildlife reserve" → list_vault(pipeline="wildlife")
-- "unposted in wildlife" → list_vault_by_status(status="unposted", pipeline="wildlife")
-- "list unposted" → list_vault_by_status(status="unposted")
-Always pass pipeline when the user names a niche/pipeline (e.g. wildlife).
+- "show Health vault" → list_vault(pipeline="Health") or list_vault_by_status(pipeline="Health")
+- "how many unposted in Health" / "posts from Health not yet posted" → list_vault_by_status(status="unposted", pipeline="Health")
+- Always pass pipeline when the user names a niche (Health, Family, Lifestyle, Sport, wildlife).
+- Reply with the **count** number clearly when asked "how many".
 
 Be concise. Timezone for schedules: Africa/Nairobi (GMT+3).
 """
@@ -3433,53 +3444,72 @@ def simple_fallback(msg, session_id):
     if any(w in lower for w in ('api key', 'api keys', 'zernio key', 'zernio keys')):
         return tool_list_api_keys().get('message') or str(tool_list_api_keys())
 
+    # --- Pipeline / niche vault (must run BEFORE generic "how many" status) ---
+    pipe = None
+    for c in _list_auto_configs():
+        n = (c.get('name') or '')
+        if n and n.lower() in lower:
+            pipe = n
+            break
+    if not pipe:
+        m = re.search(
+            r'(?:in|for|of|from)\s+(?:the\s+)?([a-zA-Z0-9._-]+)\s+(?:vault|reserve|pipeline|niche)',
+            msg, re.I,
+        )
+        if m:
+            pipe = m.group(1)
+        else:
+            m2 = re.search(
+                r'(?:vault|reserve|pipeline|niche)\s+(?:for\s+|named\s+)?([a-zA-Z0-9._-]+)',
+                msg, re.I,
+            )
+            if m2:
+                pipe = m2.group(1)
+
+    wants_unposted = any(
+        w in lower
+        for w in (
+            'unposted',
+            'not yet posted',
+            'not posted',
+            "haven't posted",
+            'have not posted',
+            'not yet',
+            'remaining',
+            'still to post',
+            'to post',
+        )
+    )
+    wants_list = any(
+        w in lower
+        for w in ('list', 'show', 'what', 'see', 'posts', 'how many', 'count', "what's in")
+    )
+
+    if pipe and (wants_list or wants_unposted or 'vault' in lower or 'reserve' in lower):
+        status = 'unposted' if wants_unposted else 'all'
+        if 'posted' in lower and not wants_unposted and 'unposted' not in lower:
+            status = 'posted'
+        r = tool_list_vault_by_status(status=status, limit=20, pipeline=pipe)
+        # For pure "how many" questions, lead with the number
+        if 'how many' in lower or 'count' in lower:
+            total = r.get('count', 0)
+            return (
+                f"📊 **{pipe}** — {status}: **{total}** posts\n\n"
+                + (r.get('message') or '')
+            )
+        return r.get('message') or r.get('error') or str(r)
+
+    if any(w in lower for w in ('reserve', 'wildlife')) or (
+        ('vault' in lower or 'unposted' in lower)
+        and any(w in lower for w in ('list', 'show', 'what', 'see', 'posts in'))
+    ):
+        status = 'unposted' if wants_unposted or 'unposted' in lower else 'all'
+        r = tool_list_vault_by_status(status=status, limit=15, pipeline=pipe)
+        return r.get('message') or r.get('error') or str(r)
+
     if any(w in lower for w in ('status', 'how many', "what's in", 'counts')) and 'auto' not in lower and 'cron' not in lower:
         r = tool_get_status()
         return r.get('message', str(r))
-
-    # Reserve / pipeline-scoped vault
-    if any(w in lower for w in ('reserve', 'wildlife')) or (
-        ('vault' in lower or 'unposted' in lower) and any(
-            w in lower for w in ('list', 'show', 'what', 'see', 'posts in')
-        )
-    ):
-        # Detect pipeline name from known configs or common words
-        pipe = None
-        for c in _list_auto_configs():
-            n = (c.get('name') or '')
-            if n and n.lower() in lower:
-                pipe = n
-                break
-        if not pipe:
-            m = re.search(
-                r'(?:in|for|of)\s+(?:the\s+)?([a-zA-Z0-9._-]+)\s+(?:vault|reserve|pipeline|niche)',
-                msg, re.I,
-            )
-            if m:
-                pipe = m.group(1)
-            else:
-                m2 = re.search(
-                    r'(?:vault|reserve|pipeline|niche)\s+(?:for\s+|named\s+)?([a-zA-Z0-9._-]+)',
-                    msg, re.I,
-                )
-                if m2:
-                    pipe = m2.group(1)
-        if 'wildlife' in lower and not pipe:
-            pipe = 'wildlife'
-
-        status = 'all'
-        if 'unposted' in lower:
-            status = 'unposted'
-        elif 'posted' in lower and 'unposted' not in lower:
-            status = 'posted'
-        elif 'scheduled' in lower:
-            status = 'scheduled'
-
-        if status != 'all' or pipe:
-            r = tool_list_vault_by_status(status=status if status != 'all' else 'all', limit=15, pipeline=pipe)
-        else:
-            r = tool_list_vault(limit=15, pipeline=pipe)
-        return r.get('message') or r.get('error') or str(r)
 
     if 'vault' in lower and any(w in lower for w in ('list', 'show', 'what')):
         r = tool_list_vault(limit=10)
