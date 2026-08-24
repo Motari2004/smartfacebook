@@ -2186,9 +2186,11 @@ def tool_post_unposted(account_username=None, limit=10):
     return tool_post_vault_batch(count=limit, account_username=account_username)
 
 
-def tool_list_accounts(platform='facebook'):
+def tool_list_accounts(platform='facebook', refresh=False):
+    """List active Facebook accounts from DB. Set refresh=True to re-sync from Zernio."""
     try:
-        refresh_all_zernio_accounts()
+        if refresh:
+            refresh_all_zernio_accounts()
         conn = get_db_connection()
         if not conn:
             return {"success": False, "error": "DB unavailable"}
@@ -2216,10 +2218,114 @@ def tool_list_accounts(platform='facebook'):
             "success": True,
             "accounts": accounts,
             "count": len(accounts),
-            "message": f"{len(accounts)} Facebook account(s)",
+            "message": f"{len(accounts)} Facebook account(s):\n" + "\n".join(
+                f"  {i}. {a.get('display_name') or a.get('username')} (@{a.get('username')})"
+                for i, a in enumerate(accounts, 1)
+            ),
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def tool_remove_facebook_account(username=None, account_id=None, permanent=False):
+    """
+    Remove a Facebook account from this app's DB (soft by default).
+    Does not disconnect the page in Zernio — only stops this service from using it.
+    Match by display name, username, or account_id.
+    """
+    if not username and not account_id:
+        return {"success": False, "error": "Provide username or account_id"}
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return {"success": False, "error": "DB unavailable"}
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+
+        # Resolve row by id, username, or display_name (case-insensitive)
+        row = None
+        if account_id:
+            cur.execute(
+                "SELECT * FROM zernio_accounts WHERE platform = 'facebook' AND account_id = %s",
+                (str(account_id),),
+            )
+            row = cur.fetchone()
+        if not row and username:
+            q = username.lstrip('@').strip()
+            cur.execute(
+                """
+                SELECT * FROM zernio_accounts
+                WHERE platform = 'facebook'
+                  AND (
+                    LOWER(username) = LOWER(%s)
+                    OR LOWER(display_name) = LOWER(%s)
+                    OR LOWER(username) LIKE LOWER(%s)
+                    OR LOWER(display_name) LIKE LOWER(%s)
+                  )
+                ORDER BY is_active DESC
+                LIMIT 1
+                """,
+                (q, q, f"%{q}%", f"%{q}%"),
+            )
+            row = cur.fetchone()
+
+        if not row:
+            cur.close()
+            conn.close()
+            return {
+                "success": False,
+                "error": f"Facebook account not found: {username or account_id}",
+                "message": f"❌ No matching Facebook account for «{username or account_id}»",
+            }
+
+        label = row.get('display_name') or row.get('username') or row.get('account_id')
+        aid = row.get('account_id')
+
+        if permanent:
+            cur.execute(
+                "DELETE FROM zernio_accounts WHERE platform = 'facebook' AND account_id = %s",
+                (aid,),
+            )
+            action = "deleted"
+        else:
+            cur.execute(
+                """
+                UPDATE zernio_accounts SET is_active = FALSE, last_sync = CURRENT_TIMESTAMP
+                WHERE platform = 'facebook' AND account_id = %s
+                """,
+                (aid,),
+            )
+            action = "deactivated"
+
+        # Clear destination on pipelines that pointed here
+        try:
+            cur.execute(
+                """
+                UPDATE auto_config
+                SET account_username = NULL, account_id = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE account_username = %s OR account_id = %s
+                """,
+                (row.get('username'), aid),
+            )
+        except Exception:
+            pass
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {
+            "success": True,
+            "action": action,
+            "username": row.get('username'),
+            "display_name": row.get('display_name'),
+            "account_id": aid,
+            "message": (
+                f"✅ Facebook account **{label}** ({action}) in this app.\n"
+                f"Pipelines that used it no longer have a destination.\n"
+                f"To fully disconnect the page, remove it in the Zernio dashboard too."
+            ),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e), "message": f"❌ {e}"}
 
 
 def tool_get_status():
@@ -3208,6 +3314,27 @@ TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "remove_facebook_account",
+            "description": "Remove a Facebook account from this app DB (soft deactivate by default). Match by display name or username e.g. Daily Wisdom.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "username": {
+                        "type": "string",
+                        "description": "Username or display name e.g. Daily Wisdom",
+                    },
+                    "account_id": {"type": "string"},
+                    "permanent": {
+                        "type": "boolean",
+                        "description": "If true, DELETE row; default false only sets is_active=false",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_status",
             "description": "Vault / posted / accounts status",
             "parameters": {"type": "object", "properties": {}},
@@ -3403,6 +3530,12 @@ def execute_tool(name, args, session_id=None):
             )
         if name == 'list_accounts':
             return tool_list_accounts('facebook')
+        if name == 'remove_facebook_account':
+            return tool_remove_facebook_account(
+                username=args.get('username') or args.get('name') or args.get('display_name'),
+                account_id=args.get('account_id'),
+                permanent=bool(args.get('permanent', False)),
+            )
         if name == 'get_status':
             return tool_get_status()
         if name == 'list_scheduled':
@@ -3467,6 +3600,11 @@ VAULT / RESERVE:
 - "how many unposted in Health" / "posts from Health not yet posted" → list_vault_by_status(status="unposted", pipeline="Health")
 - Always pass pipeline when the user names a niche (Health, Family, Lifestyle, Sport, wildlife).
 - Reply with the **count** number clearly when asked "how many".
+
+ACCOUNTS:
+- "list accounts" / "see facebook accounts" → list_accounts
+- "remove facebook account Daily Wisdom" → remove_facebook_account(username="Daily Wisdom")
+- Soft-removes from this app DB (is_active=false). Does not disconnect the page in Zernio.
 
 Be concise. Timezone for schedules: Africa/Nairobi (GMT+3).
 """
@@ -3627,6 +3765,22 @@ def simple_fallback(msg, session_id):
         if m:
             return tool_auto_remove(m.group(1)).get('message')
         return "Say: Remove pipeline <name>"
+
+    # Remove Facebook account from this app (not from Zernio)
+    if any(w in lower for w in ('remove facebook', 'delete facebook', 'remove account', 'delete account')) or (
+        ('remove' in lower or 'delete' in lower) and 'account' in lower
+    ):
+        m = re.search(
+            r'(?:remove|delete)\s+(?:this\s+)?(?:facebook\s+)?(?:account\s+)?(.+)$',
+            msg.strip(), re.I,
+        )
+        name_part = (m.group(1).strip() if m else '').strip(' "\'')
+        # strip trailing words
+        name_part = re.sub(r'\s+(account|from\s+here|please)\s*$', '', name_part, flags=re.I).strip()
+        if name_part and name_part.lower() not in ('account', 'facebook', 'the'):
+            permanent = 'permanent' in lower or 'forever' in lower
+            return tool_remove_facebook_account(username=name_part, permanent=permanent).get('message')
+        return "Say: remove facebook account Daily Wisdom"
 
     if any(w in lower for w in ('stop auto', 'auto stop')):
         return tool_auto_stop().get('message')
