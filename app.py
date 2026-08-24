@@ -72,11 +72,14 @@ else:
     GEMINI_API_KEYS = []
     print("⚠️  No GEMINI_API_KEYS environment variable set!")
 
+# Current IDs for OpenAI-compat endpoint (as of 2026-08). Avoid retired 1.5/2.0 names.
 GEMINI_MODELS = [
     "gemini-2.5-flash-lite",
-    "gemini-2.0-flash-lite",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
+    "gemini-2.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
+    "gemini-3.7-flash",
 ]
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 
@@ -105,25 +108,38 @@ def next_gemini_key():
 def next_gemini_model():
     global _gemini_model_index
     if not GEMINI_MODELS:
-        return "gemini-2.0-flash-lite"
-    model = GEMINI_MODELS[_gemini_model_index % len(GEMINI_MODELS)]
-    _gemini_model_index += 1
-    return model
+        return "gemini-2.5-flash-lite"
+    # Skip models still on cooldown when picking
+    for _ in range(len(GEMINI_MODELS)):
+        model = GEMINI_MODELS[_gemini_model_index % len(GEMINI_MODELS)]
+        _gemini_model_index += 1
+        until = _gemini_model_cooldown.get(model)
+        if until and datetime.now() < until:
+            continue
+        return model
+    return GEMINI_MODELS[_gemini_model_index % len(GEMINI_MODELS)]
 
 
-def handle_model_rate_limit(model):
-    _gemini_model_cooldown[model] = datetime.now() + timedelta(seconds=60)
-    print(f"⏳ Model {model} on cooldown for 60 seconds")
+def handle_model_rate_limit(model, seconds=60):
+    _gemini_model_cooldown[model] = datetime.now() + timedelta(seconds=seconds)
+    print(f"⏳ Model {model} on cooldown for {seconds}s")
 
 
-def call_gemini(messages, tools=None, model=None, max_tokens=1200, timeout=45):
+def call_gemini(messages, tools=None, model=None, max_tokens=1200, timeout=45, _attempt=0):
+    """Call Gemini OpenAI-compat API. Caps retries to avoid 404/429 spam loops."""
+    max_attempts = max(len(GEMINI_MODELS) * 2, 4)
+    if _attempt >= max_attempts:
+        return None, "All Gemini models exhausted (404/429). Using keyword fallback."
+
     if model is None:
         model = next_gemini_model()
+
     if model in _gemini_model_cooldown:
-        if datetime.now() < _gemini_model_cooldown[model]:
+        until = _gemini_model_cooldown[model]
+        if datetime.now() < until:
             next_model = next_gemini_model()
             if next_model != model:
-                return call_gemini(messages, tools, next_model, max_tokens, timeout)
+                return call_gemini(messages, tools, next_model, max_tokens, timeout, _attempt + 1)
             return None, "All models on cooldown"
 
     key = next_gemini_key()
@@ -154,30 +170,41 @@ def call_gemini(messages, tools=None, model=None, max_tokens=1200, timeout=45):
             _gemini_key_cooldown[key] = datetime.now() + timedelta(seconds=300)
             next_key = next_gemini_key()
             if next_key and next_key != key:
-                return call_gemini(messages, tools, model, max_tokens, timeout)
+                return call_gemini(messages, tools, model, max_tokens, timeout, _attempt + 1)
             return None, "All API keys invalid or on cooldown"
 
         if r.status_code == 429:
-            handle_model_rate_limit(model)
+            handle_model_rate_limit(model, seconds=90)
             next_model = next_gemini_model()
             if next_model != model:
-                return call_gemini(messages, tools, next_model, max_tokens, timeout)
+                return call_gemini(messages, tools, next_model, max_tokens, timeout, _attempt + 1)
             return None, "Rate limit exceeded"
 
+        # 404 = model id not available for this key/endpoint — long cooldown
+        if r.status_code == 404:
+            handle_model_rate_limit(model, seconds=3600)
+            print(f"⚠️ Model {model} returned 404 — cooling down 1h, trying next")
+            next_model = next_gemini_model()
+            if next_model != model:
+                return call_gemini(messages, tools, next_model, max_tokens, timeout, _attempt + 1)
+            return None, f"Gemini model not found (404): {model}"
+
         if r.status_code != 200:
-            if r.status_code not in (400, 403):
+            # Don't recurse forever on client errors
+            if r.status_code >= 500:
                 next_model = next_gemini_model()
                 if next_model != model:
-                    return call_gemini(messages, tools, next_model, max_tokens, timeout)
+                    return call_gemini(messages, tools, next_model, max_tokens, timeout, _attempt + 1)
             return None, f"Gemini {r.status_code}: {r.text[:300]}"
 
         if model in _gemini_model_cooldown:
             del _gemini_model_cooldown[model]
         return r.json(), None
     except Exception as e:
+        print(f"❌ Gemini exception ({model}): {e}")
         next_model = next_gemini_model()
-        if next_model != model:
-            return call_gemini(messages, tools, next_model, max_tokens, timeout)
+        if next_model != model and _attempt + 1 < max_attempts:
+            return call_gemini(messages, tools, next_model, max_tokens, timeout, _attempt + 1)
         return None, str(e)
 
 
@@ -2120,6 +2147,7 @@ def tool_auto_setup(name='default', source_handle=None, account_username=None,
                     account_id=None, poll_interval_sec=300, max_posts_per_run=2,
                     media_only=True, include_reposts=False, enabled=False,
                     source_handles=None, niche=None, content_type='feed'):
+    """Create/update a pipeline. Facebook destination is OPTIONAL — can set later."""
     name = (name or 'default').strip()
     sources = source_handles
     if not sources and source_handle:
@@ -2133,14 +2161,19 @@ def tool_auto_setup(name='default', source_handle=None, account_username=None,
     if not sources:
         return {"success": False, "error": "source_handle or source_handles required"}
 
+    # Optional FB account: auto-pick only if exactly one connected; never fail if missing
     if not account_username and not account_id:
         accs = tool_list_accounts('facebook')
         alist = accs.get('accounts') or []
         if len(alist) == 1:
             account_username = alist[0].get('username')
             account_id = alist[0].get('account_id')
-        elif not alist:
-            return {"success": False, "error": "No Facebook accounts. Connect one in Zernio."}
+
+    dest_label = None
+    if account_username or account_id:
+        dest_label = f"Facebook @{account_username or account_id}"
+    else:
+        dest_label = "Facebook (destination not set yet)"
 
     cfg = {
         'name': name,
@@ -2156,16 +2189,47 @@ def tool_auto_setup(name='default', source_handle=None, account_username=None,
         'include_reposts': bool(include_reposts),
         'content_type': content_type or 'feed',
         'last_error': None,
-        'last_result': 'configured',
+        'last_result': 'configured' + ('' if account_username or account_id else ' · no FB destination yet'),
     }
     if not _save_auto_config(cfg):
         return {"success": False, "error": "Failed to save config"}
+    tip = ""
+    if not account_username and not account_id:
+        tip = "\nTip: later say “set destination for Lifestyle to @YourPage” or list accounts."
     return {
         "success": True,
         "message": (
-            f"Pipeline '{name}' configured: "
-            f"@{' + @'.join(sources)} → Facebook @{account_username or account_id} "
+            f"✅ Pipeline '{name}' configured: "
+            f"@{' + @'.join(sources)} → {dest_label} "
             f"(every {cfg['poll_interval_sec']}s, max {cfg['max_posts_per_run']}/run)"
+            f"{tip}"
+        ),
+        "config": cfg,
+    }
+
+
+def tool_auto_set_destination(name, account_username=None, account_id=None):
+    """Attach/update Facebook destination on an existing pipeline."""
+    if not name:
+        return {"success": False, "error": "pipeline name required"}
+    resolved = _resolve_pipeline_name(name) or name
+    cfg = _load_auto_config(resolved)
+    if not cfg:
+        return {"success": False, "error": f"Pipeline '{name}' not found"}
+    if not account_username and not account_id:
+        return {"success": False, "error": "account_username or account_id required"}
+    if account_username and not account_id:
+        account_id = get_facebook_account_id(account_username=account_username)
+    cfg['account_username'] = account_username or cfg.get('account_username')
+    cfg['account_id'] = account_id or cfg.get('account_id')
+    cfg['last_result'] = f"destination set → @{cfg.get('account_username') or cfg.get('account_id')}"
+    if not _save_auto_config(cfg):
+        return {"success": False, "error": "Failed to save"}
+    return {
+        "success": True,
+        "message": (
+            f"✅ Pipeline '{resolved}' destination: "
+            f"Facebook @{cfg.get('account_username') or cfg.get('account_id')}"
         ),
         "config": cfg,
     }
@@ -2328,39 +2392,43 @@ def _run_one_pipeline(cfg):
     account_username = cfg.get('account_username')
     account_id = cfg.get('account_id')
     content_type = cfg.get('content_type') or 'feed'
+    can_post = bool(account_username or account_id)
 
     # Prefer unposted reserve tagged with this pipeline name
     posted_from_reserve = 0
-    try:
-        conn = get_db_connection()
-        if conn:
-            cur = conn.cursor(cursor_factory=RealDictCursor)
-            cur.execute("""
-                SELECT v.* FROM vault v
-                WHERE v.handler_handle = %s
-                AND NOT EXISTS (
-                    SELECT 1 FROM posted_posts p
-                    WHERE p.uri = v.uri AND p.platform = 'facebook'
-                      AND p.status IN ('completed', 'posted')
-                )
-                ORDER BY v.saved_at ASC
-                LIMIT %s
-            """, (name, max_posts))
-            reserve = cur.fetchall()
-            cur.close()
-            conn.close()
-            for item in reserve:
-                res = tool_post_now(
-                    vault_id=item['id'],
-                    account_username=account_username,
-                    account_id=account_id,
-                    content_type=content_type,
-                )
-                if res.get('success'):
-                    posted_from_reserve += 1
-                    _mark_seen(name, item.get('uri'), posted=True)
-    except Exception as e:
-        print(f"reserve post: {e}")
+    if can_post:
+        try:
+            conn = get_db_connection()
+            if conn:
+                cur = conn.cursor(cursor_factory=RealDictCursor)
+                cur.execute("""
+                    SELECT v.* FROM vault v
+                    WHERE v.handler_handle = %s
+                    AND NOT EXISTS (
+                        SELECT 1 FROM posted_posts p
+                        WHERE p.uri = v.uri AND p.platform = 'facebook'
+                          AND p.status IN ('completed', 'posted')
+                    )
+                    ORDER BY v.saved_at ASC
+                    LIMIT %s
+                """, (name, max_posts))
+                reserve = cur.fetchall()
+                cur.close()
+                conn.close()
+                for item in reserve:
+                    res = tool_post_now(
+                        vault_id=item['id'],
+                        account_username=account_username,
+                        account_id=account_id,
+                        content_type=content_type,
+                    )
+                    if res.get('success'):
+                        posted_from_reserve += 1
+                        _mark_seen(name, item.get('uri'), posted=True)
+        except Exception as e:
+            print(f"reserve post: {e}")
+    else:
+        print(f"Pipeline {name}: no FB destination — will only fetch into vault reserve")
 
     if posted_from_reserve >= max_posts:
         msg = f"Posted {posted_from_reserve} from reserve"
@@ -2414,34 +2482,41 @@ def _run_one_pipeline(cfg):
         tool_add_to_vault(fetched_posts, handler_handle=name)
 
     posted_new = 0
-    for p in fetched_posts[:remaining]:
-        _mark_seen(name, p['uri'], posted=False)
-        # find vault id
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute("SELECT id FROM vault WHERE uri = %s", (p['uri'],))
-            row = cur.fetchone()
-            cur.close()
-            conn.close()
-            vid = row[0] if row else None
-        except Exception:
-            vid = None
-        if vid:
-            res = tool_post_now(
-                vault_id=vid,
-                account_username=account_username,
-                account_id=account_id,
-                content_type=content_type,
-            )
-            if res.get('success'):
-                posted_new += 1
-                _mark_seen(name, p['uri'], posted=True)
+    if can_post:
+        for p in fetched_posts[:remaining]:
+            _mark_seen(name, p['uri'], posted=False)
+            try:
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("SELECT id FROM vault WHERE uri = %s", (p['uri'],))
+                row = cur.fetchone()
+                cur.close()
+                conn.close()
+                vid = row[0] if row else None
+            except Exception:
+                vid = None
+            if vid:
+                res = tool_post_now(
+                    vault_id=vid,
+                    account_username=account_username,
+                    account_id=account_id,
+                    content_type=content_type,
+                )
+                if res.get('success'):
+                    posted_new += 1
+                    _mark_seen(name, p['uri'], posted=True)
+    else:
+        for p in fetched_posts:
+            if p.get('uri'):
+                _mark_seen(name, p['uri'], posted=False)
 
     total = posted_from_reserve + posted_new
-    msg = f"Posted {total} (reserve={posted_from_reserve}, new={posted_new})"
+    if can_post:
+        msg = f"Posted {total} (reserve={posted_from_reserve}, new={posted_new})"
+    else:
+        msg = f"Fetched {len(fetched_posts)} into vault (no FB destination yet)"
     cfg['last_result'] = msg
-    cfg['last_error'] = None
+    cfg['last_error'] = None if can_post else "No Facebook destination"
     cfg['last_run_at'] = datetime.now()
     _save_auto_config(cfg)
     return {"success": True, "posted": total, "message": msg}
@@ -2830,19 +2905,38 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "auto_setup",
-            "description": "Configure auto pipeline: Bluesky source(s) → Facebook account",
+            "description": "Configure auto pipeline. Facebook account is OPTIONAL — can set destination later with auto_set_destination.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string"},
+                    "name": {"type": "string", "description": "Pipeline name e.g. Lifestyle"},
                     "source_handle": {"type": "string"},
                     "source_handles": {"type": "array", "items": {"type": "string"}},
-                    "account_username": {"type": "string"},
+                    "account_username": {
+                        "type": "string",
+                        "description": "Optional Facebook username; omit to set later",
+                    },
                     "poll_interval_sec": {"type": "integer"},
                     "max_posts_per_run": {"type": "integer"},
                     "enabled": {"type": "boolean"},
                 },
                 "required": ["source_handle"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "auto_set_destination",
+            "description": "Set or change Facebook destination for an existing pipeline",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Pipeline name"},
+                    "account_username": {"type": "string"},
+                    "account_id": {"type": "string"},
+                },
+                "required": ["name"],
             },
         },
     },
@@ -3004,6 +3098,12 @@ def execute_tool(name, args, session_id=None):
                 max_posts_per_run=args.get('max_posts_per_run') or 2,
                 enabled=bool(args.get('enabled', False)),
             )
+        if name == 'auto_set_destination':
+            return tool_auto_set_destination(
+                name=args.get('name'),
+                account_username=args.get('account_username'),
+                account_id=args.get('account_id'),
+            )
         if name == 'auto_start':
             return tool_auto_start(args.get('name'))
         if name == 'auto_stop':
@@ -3034,6 +3134,12 @@ You can:
 - Auto pipelines: named configs watching Bluesky → Facebook
 - list pipelines / start pipeline NAME / stop pipeline NAME / auto status
 - Master-fetch fills a pipeline's vault reserve
+
+PIPELINE SETUP:
+- Facebook destination is OPTIONAL at creation. If the user says "set destination later" / "leave destination", call auto_setup with only name + source_handle (no account_username).
+- Example: name="Lifestyle", source_handle="sundaedivine.lol"
+- Later: auto_set_destination(name="Lifestyle", account_username="...")
+- Never refuse setup just because Facebook is missing.
 
 VAULT / RESERVE:
 - "list vault" → list_vault()
@@ -3237,20 +3343,41 @@ def simple_fallback(msg, session_id):
         chosen = next((it for it in items if it.get('images')), items[0])
         return tool_post_now(vault_id=chosen.get('id')).get('message')
 
-    # auto setup pattern
+    # auto setup with optional destination
     m = re.search(
         r'auto\s+setup.*?watch\s+@?([a-zA-Z0-9._-]+).*?(?:post\s+to|to)\s+@?([a-zA-Z0-9._-]+)',
         msg, re.I,
     )
-    if m or ('auto setup' in lower and 'watch' in lower):
-        if m:
-            return tool_auto_setup(
-                name='default',
-                source_handle=m.group(1),
-                account_username=m.group(2),
-                enabled=True,
-            ).get('message')
-        return "Say: Auto setup watch @blueskyhandle post to @facebookusername"
+    if m:
+        return tool_auto_setup(
+            name='default',
+            source_handle=m.group(1),
+            account_username=m.group(2),
+            enabled=False,
+        ).get('message')
+
+    # "pipeline Lifestyle source sundaedivine.lol" / "set up Lifestyle with sundaedivine"
+    m2 = re.search(
+        r'(?:pipeline|auto\s+setup|set\s*up)\s+([a-zA-Z0-9._-]+).*?(?:source|watch|from)\s+@?([a-zA-Z0-9._-]+(?:\.[a-zA-Z0-9._-]+)*)',
+        msg, re.I,
+    )
+    if m2:
+        return tool_auto_setup(
+            name=m2.group(1),
+            source_handle=m2.group(2),
+            enabled=False,
+        ).get('message')
+
+    if 'auto setup' in lower and 'watch' in lower:
+        return "Say: Auto setup watch @blueskyhandle  (Facebook optional)  or  pipeline Lifestyle source sundaedivine.lol"
+
+    # set destination for existing pipeline
+    m3 = re.search(
+        r'(?:set\s+)?destination\s+(?:for\s+)?([a-zA-Z0-9._-]+)\s+(?:to\s+)?@?([a-zA-Z0-9._-]+)',
+        msg, re.I,
+    )
+    if m3:
+        return tool_auto_set_destination(name=m3.group(1), account_username=m3.group(2)).get('message')
 
     return (
         "Bluesky → Facebook vault.\n"
