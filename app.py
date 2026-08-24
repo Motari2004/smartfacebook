@@ -1503,84 +1503,10 @@ def _extract_images_from_embed(embed):
     return images
 
 
-def _raw_get_author_feed(client, actor, limit=20):
-    """
-    Fetch author feed via raw HTTP so video embeds don't break atproto Pydantic models.
-    Returns list of normalized post dicts.
-    """
-    actor = (actor or '').strip().lstrip('@')
-    if actor and '.' not in actor:
-        actor = actor + '.bsky.social'
-    limit = max(1, min(int(limit or 20), 50))
-
-    base = 'https://bsky.social'
-    try:
-        # Prefer client's configured host if available
-        host = getattr(getattr(client, 'request', None), 'base_url', None) or getattr(client, '_base_url', None)
-        if host:
-            base = str(host).rstrip('/')
-    except Exception:
-        pass
-
-    url = f"{base}/xrpc/app.bsky.feed.getAuthorFeed"
-    headers = _client_auth_headers(client)
-    # Public AppView also works for many reads without auth
-    params = {"actor": actor, "limit": limit}
-
-    try:
-        r = requests.get(url, headers=headers or None, params=params, timeout=30)
-        if r.status_code == 401 and not headers:
-            # retry against public API
-            r = requests.get(
-                "https://api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed",
-                params=params,
-                timeout=30,
-            )
-        if r.status_code != 200:
-            # Fallback public AppView
-            r2 = requests.get(
-                "https://api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed",
-                params=params,
-                timeout=30,
-            )
-            if r2.status_code == 200:
-                r = r2
-            else:
-                raise RuntimeError(f"getAuthorFeed HTTP {r.status_code}: {r.text[:200]}")
-        data = r.json()
-    except Exception as e:
-        # Last resort: typed client (may fail on video)
-        print(f"raw feed failed ({e}); trying typed client")
-        feed = client.get_author_feed(actor=actor, limit=limit)
-        posts = []
-        for item in feed.feed:
-            post = item.post
-            record = post.record
-            images = []
-            view_embed = getattr(post, 'embed', None)
-            if view_embed:
-                imgs = getattr(view_embed, 'images', None)
-                if imgs:
-                    for im in imgs:
-                        u = getattr(im, 'fullsize', None) or getattr(im, 'thumb', None)
-                        if u:
-                            images.append({"url": u, "thumb": getattr(im, 'thumb', u)})
-            posts.append({
-                "uri": post.uri,
-                "author": post.author.handle if post.author else actor,
-                "display_name": getattr(post.author, 'display_name', None),
-                "text": getattr(record, 'text', '') or '',
-                "images": images,
-                "likes": getattr(post, 'like_count', 0) or 0,
-                "reposts": getattr(post, 'repost_count', 0) or 0,
-                "replies": getattr(post, 'reply_count', 0) or 0,
-                "created_at": getattr(record, 'created_at', None),
-                "is_repost": getattr(item, 'reason', None) is not None,
-            })
-        return posts
-
+def _parse_feed_items(feed_items, actor):
+    """Normalize raw getAuthorFeed feed[] items to post dicts."""
     posts = []
-    for item in data.get('feed') or []:
+    for item in feed_items or []:
         post = item.get('post') or {}
         record = post.get('record') or {}
         author = post.get('author') or {}
@@ -1601,6 +1527,141 @@ def _raw_get_author_feed(client, actor, limit=20):
     return posts
 
 
+def _http_get_author_feed_page(client, actor, limit=50, cursor=None):
+    """
+    One page of getAuthorFeed via raw HTTP (avoids Pydantic video-embed crashes).
+    Returns (posts_list, next_cursor).
+    """
+    actor = (actor or '').strip().lstrip('@')
+    if actor and '.' not in actor:
+        actor = actor + '.bsky.social'
+    page_limit = max(1, min(int(limit or 50), 100))
+
+    base = 'https://bsky.social'
+    try:
+        host = getattr(getattr(client, 'request', None), 'base_url', None) or getattr(client, '_base_url', None)
+        if host:
+            base = str(host).rstrip('/')
+    except Exception:
+        pass
+
+    url = f"{base}/xrpc/app.bsky.feed.getAuthorFeed"
+    headers = _client_auth_headers(client) if client else {}
+    params = {"actor": actor, "limit": page_limit}
+    if cursor:
+        params["cursor"] = cursor
+
+    def _try(u, h, p):
+        return requests.get(u, headers=h or None, params=p, timeout=30)
+
+    r = _try(url, headers, params)
+    if r.status_code in (401, 403) or r.status_code != 200:
+        r2 = _try(
+            "https://api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed",
+            headers if r.status_code != 401 else None,
+            params,
+        )
+        if r2.status_code == 200:
+            r = r2
+        elif r.status_code != 200:
+            raise RuntimeError(f"getAuthorFeed HTTP {r.status_code}: {r.text[:200]}")
+
+    data = r.json()
+    posts = _parse_feed_items(data.get('feed') or [], actor)
+    next_cursor = data.get('cursor') or None
+    return posts, next_cursor
+
+
+def _raw_get_author_feed(client, actor, limit=20, max_pages=1):
+    """
+    Fetch author feed via raw HTTP so video embeds don't break atproto models.
+    Paginates with cursor when max_pages > 1 (or when limit > one page).
+
+    Args:
+        limit: target number of posts to return (capped across pages)
+        max_pages: max XRPC pages to walk (each page up to 100 items)
+    """
+    actor = (actor or '').strip().lstrip('@')
+    if actor and '.' not in actor:
+        actor = actor + '.bsky.social'
+
+    target = max(1, int(limit or 20))
+    # Auto page when caller asks for more than one Bluesky page
+    pages = max(1, int(max_pages or 1))
+    if target > 50 and pages < 2:
+        pages = min(10, (target + 49) // 50)
+
+    page_size = min(100, max(20, min(target, 100)))
+    all_posts = []
+    cursor = None
+    seen_uris = set()
+
+    for page_i in range(pages):
+        try:
+            batch, cursor = _http_get_author_feed_page(
+                client, actor, limit=page_size, cursor=cursor
+            )
+        except Exception as e:
+            if page_i == 0:
+                # Last resort: typed client (may fail on video)
+                print(f"raw feed failed ({e}); trying typed client")
+                try:
+                    feed = client.get_author_feed(actor=actor, limit=min(target, 50))
+                    posts = []
+                    for item in feed.feed:
+                        post = item.post
+                        record = post.record
+                        images = []
+                        view_embed = getattr(post, 'embed', None)
+                        if view_embed:
+                            imgs = getattr(view_embed, 'images', None)
+                            if imgs:
+                                for im in imgs:
+                                    u = getattr(im, 'fullsize', None) or getattr(im, 'thumb', None)
+                                    if u:
+                                        images.append({"url": u, "thumb": getattr(im, 'thumb', u)})
+                        posts.append({
+                            "uri": post.uri,
+                            "author": post.author.handle if post.author else actor,
+                            "display_name": getattr(post.author, 'display_name', None),
+                            "text": getattr(record, 'text', '') or '',
+                            "images": images,
+                            "likes": getattr(post, 'like_count', 0) or 0,
+                            "reposts": getattr(post, 'repost_count', 0) or 0,
+                            "replies": getattr(post, 'reply_count', 0) or 0,
+                            "created_at": getattr(record, 'created_at', None),
+                            "is_repost": getattr(item, 'reason', None) is not None,
+                        })
+                    return posts[:target]
+                except Exception as e2:
+                    print(f"typed client also failed: {e2}")
+                    raise e
+            print(f"feed page {page_i + 1} failed for @{actor}: {e}")
+            break
+
+        if not batch:
+            break
+
+        for p in batch:
+            uri = p.get('uri')
+            if uri and uri in seen_uris:
+                continue
+            if uri:
+                seen_uris.add(uri)
+            all_posts.append(p)
+            if len(all_posts) >= target:
+                break
+
+        print(f"📄 @{actor} page {page_i + 1}: +{len(batch)} items (total {len(all_posts)}, cursor={'yes' if cursor else 'end'})")
+
+        if len(all_posts) >= target:
+            break
+        if not cursor:
+            break
+
+    return all_posts[:target]
+
+
 def tool_fetch_posts(session_id, actor, limit=15, media_only=True, include_reposts=False):
     try:
         client, meta = _get_client_for_session(session_id)
@@ -1613,7 +1674,12 @@ def tool_fetch_posts(session_id, actor, limit=15, media_only=True, include_repos
         if '.' not in actor:
             actor = actor + '.bsky.social'
 
-        raw_posts = _raw_get_author_feed(client, actor, limit=min(int(limit or 15), 50))
+        want = max(1, int(limit or 15))
+        raw_posts = _raw_get_author_feed(
+            client, actor,
+            limit=min(want * 3 if media_only else want, 200),
+            max_pages=max(1, min(8, (want + 49) // 50 + (2 if media_only else 0))),
+        )
         posts = []
         for p in raw_posts:
             if not include_reposts and p.get('is_repost'):
@@ -2455,7 +2521,7 @@ def _run_one_pipeline(cfg):
             if '.' not in actor:
                 actor = actor + '.bsky.social'
             # Raw XRPC — avoids atproto Pydantic crash on app.bsky.embed.video#view
-            for p in _raw_get_author_feed(client, actor, limit=20):
+            for p in _raw_get_author_feed(client, actor, limit=40, max_pages=3):
                 if not include_reposts and p.get('is_repost'):
                     continue
                 uri = p.get('uri')
@@ -2593,7 +2659,11 @@ def start_auto_pilot():
 # MASTER FETCH (reserve)
 # ============================================================
 
-def tool_master_fetch_niche(name=None, limit_per_source=20):
+def tool_master_fetch_niche(name=None, limit_per_source=50, max_pages=5):
+    """
+    Fill niche reserve from Bluesky sources with pagination.
+    limit_per_source = target media posts to collect per source (walks pages until filled or max_pages).
+    """
     if not name:
         return {"success": False, "error": "name required"}
     cfg = _load_auto_config(name)
@@ -2609,14 +2679,22 @@ def tool_master_fetch_niche(name=None, limit_per_source=20):
     if not client:
         return {"success": False, "error": "No Bluesky session / master account"}
 
+    target = max(10, int(limit_per_source or 50))
+    pages = max(1, min(int(max_pages or 5), 15))
+    # Scan enough raw items to find media (many accounts post text-only / video)
+    scan_limit = min(500, max(target * 4, pages * 50))
+
     all_posts = []
+    per_source = {}
     for src in sources:
         actor = src.lstrip('@')
         if '.' not in actor:
             actor = actor + '.bsky.social'
+        collected = 0
         try:
-            # Raw XRPC — video embeds (app.bsky.embed.video#view) no longer crash fetch
-            for p in _raw_get_author_feed(client, actor, limit=int(limit_per_source or 20)):
+            # Paginate until we have enough *media* posts or pages run out
+            raw = _raw_get_author_feed(client, actor, limit=scan_limit, max_pages=pages)
+            for p in raw:
                 images = p.get('images') or []
                 if cfg.get('media_only', True) and not images:
                     continue
@@ -2633,26 +2711,41 @@ def tool_master_fetch_niche(name=None, limit_per_source=20):
                     "replies": p.get('replies') or 0,
                     "created_at": p.get('created_at'),
                 })
+                collected += 1
+                if collected >= target:
+                    break
+            per_source[actor] = collected
+            print(f"📥 master-fetch @{actor}: {collected} media posts (scanned {len(raw)} over ≤{pages} pages)")
         except Exception as e:
             print(f"master fetch {src}: {e}")
+            per_source[actor] = 0
 
     result = tool_add_to_vault(all_posts, handler_handle=name)
+    detail = ", ".join(f"@{a}: {n}" for a, n in per_source.items())
     return {
         "success": True,
         "saved": result.get('saved', 0),
         "skipped": result.get('skipped', 0),
-        "message": f"Reserve for '{name}': saved {result.get('saved', 0)} (skipped {result.get('skipped', 0)})",
+        "per_source": per_source,
+        "message": (
+            f"Reserve for '{name}': saved {result.get('saved', 0)} "
+            f"(skipped {result.get('skipped', 0)}) · {detail}"
+        ),
     }
 
 
-def tool_master_fetch_all_niches(limit_per_source=20):
+def tool_master_fetch_all_niches(limit_per_source=50, max_pages=5):
     configs = _list_auto_configs()
     if not configs:
         return {"success": False, "error": "No pipelines configured"}
     total_saved = 0
     parts = []
     for c in configs:
-        r = tool_master_fetch_niche(name=c.get('name'), limit_per_source=limit_per_source)
+        r = tool_master_fetch_niche(
+            name=c.get('name'),
+            limit_per_source=limit_per_source,
+            max_pages=max_pages,
+        )
         if r.get('success'):
             total_saved += int(r.get('saved') or 0)
             parts.append(f"{c.get('name')}: +{r.get('saved', 0)}")
@@ -3546,16 +3639,25 @@ def api_auto_remove():
 def api_master_fetch_niche():
     data = request.json or {}
     name = data.get('name')
-    limit_per_source = int(data.get('limit_per_source', 20))
-    result = tool_master_fetch_niche(name=name, limit_per_source=limit_per_source)
+    limit_per_source = int(data.get('limit_per_source', 50))
+    max_pages = int(data.get('max_pages', 5))
+    result = tool_master_fetch_niche(
+        name=name,
+        limit_per_source=limit_per_source,
+        max_pages=max_pages,
+    )
     return jsonify(result), (200 if result.get('success') else 400)
 
 
 @app.route('/api/niche/master-fetch-all', methods=['POST'])
 def api_master_fetch_all():
     data = request.json or {}
-    limit_per_source = int(data.get('limit_per_source', 20))
-    result = tool_master_fetch_all_niches(limit_per_source=limit_per_source)
+    limit_per_source = int(data.get('limit_per_source', 50))
+    max_pages = int(data.get('max_pages', 5))
+    result = tool_master_fetch_all_niches(
+        limit_per_source=limit_per_source,
+        max_pages=max_pages,
+    )
     return jsonify(result), (200 if result.get('success') else 400)
 
 
