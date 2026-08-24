@@ -2698,9 +2698,7 @@ def _run_one_pipeline(cfg):
 
 
 def tool_auto_run_now(name=None):
-    if not get_cron_state() and name is None:
-        # still allow explicit named runs
-        pass
+    """Run one named pipeline, or every enabled pipeline (cron / auto-run)."""
     results = []
     if name:
         resolved = _resolve_pipeline_name(name) or name
@@ -2713,9 +2711,19 @@ def tool_auto_run_now(name=None):
         for cfg in _list_auto_configs():
             if not cfg.get('enabled'):
                 continue
-            r = _run_one_pipeline(cfg)
+            try:
+                r = _run_one_pipeline(cfg)
+            except Exception as e:
+                r = {"success": False, "error": str(e), "posted": 0}
             results.append({"name": cfg.get('name'), **r})
-    total_posted = sum(r.get('posted', 0) for r in results if r.get('success'))
+    if not results and name is None:
+        return {
+            "success": True,
+            "results": [],
+            "posted_count": 0,
+            "message": "No enabled pipelines — say: start pipeline <name>",
+        }
+    total_posted = sum(int(r.get('posted') or 0) for r in results if r.get('success'))
     return {
         "success": True,
         "results": results,
@@ -3934,18 +3942,41 @@ def api_master_status():
 
 @app.route('/api/cron/auto-run', methods=['GET'])
 def cron_auto_run():
+    """
+    External / Vercel cron endpoint — same pattern as Instagram service.
+    Runs ALL enabled pipelines once (reserve → post if FB destination set).
+    Hit this on a schedule, e.g. every 5–10 minutes.
+    """
     try:
-        if not get_cron_state():
-            return jsonify({"success": True, "skipped": True, "reason": "cron disabled"})
+        # Mirror Instagram: always attempt enabled pipelines (no global gate that blocks cron)
+        enabled = [c for c in _list_auto_configs() if c.get('enabled')]
+        if not enabled:
+            msg = "No enabled pipelines — start one in chat or UI first"
+            print(f"🔄 Cron auto-run skipped: {msg}")
+            return jsonify({
+                "success": True,
+                "skipped": True,
+                "reason": msg,
+                "timestamp": datetime.now().isoformat(),
+            })
+
+        set_cron_state(True)  # mark cron active when external scheduler is hitting us
         result = tool_auto_run_now()
+        print(f"🔄 Cron auto-run: {result.get('message', 'done')}")
         return jsonify({
             "success": True,
             "result": result,
+            "pipelines_run": len(enabled),
             "timestamp": datetime.now().isoformat(),
         })
     except Exception as e:
+        print(f"❌ Cron auto-run error: {e}")
         traceback.print_exc()
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "timestamp": datetime.now().isoformat(),
+        }), 500
 
 
 @app.route('/api/post-now/accounts', methods=['GET'])
