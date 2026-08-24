@@ -2364,7 +2364,7 @@ def tool_auto_setup(name='default', source_handle=None, account_username=None,
         'include_reposts': bool(include_reposts),
         'content_type': content_type or 'feed',
         'last_error': None,
-        'last_result': 'configured' + ('' if account_username or account_id else ' · no FB destination yet'),
+        'last_result': 'configured',
     }
     if not _save_auto_config(cfg):
         return {"success": False, "error": "Failed to save config"}
@@ -2376,7 +2376,7 @@ def tool_auto_setup(name='default', source_handle=None, account_username=None,
         "message": (
             f"✅ Pipeline '{name}' configured: "
             f"@{' + @'.join(sources)} → {dest_label} "
-            f"(every {cfg['poll_interval_sec']}s, max {cfg['max_posts_per_run']}/run)"
+            f"(max {cfg['max_posts_per_run']}/run · driven by external cron)"
             f"{tip}"
         ),
         "config": cfg,
@@ -2697,8 +2697,9 @@ def _run_one_pipeline(cfg):
         msg = f"Posted {total} (new={posted_new}, reserve={posted_from_reserve})"
         cfg['last_error'] = None
     else:
-        msg = f"Fetched {len(fetched_posts)} into vault (no FB destination yet)"
-        cfg['last_error'] = "No Facebook destination"
+        # No destination yet: still useful — fill vault only
+        msg = f"Fetched {len(fetched_posts)} into vault"
+        cfg['last_error'] = None
     cfg['last_result'] = msg
     cfg['last_run_at'] = datetime.now()
     _save_auto_config(cfg)

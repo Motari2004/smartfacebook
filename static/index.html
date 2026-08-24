@@ -1064,8 +1064,8 @@ async function refreshAutoStatus() {
             if (enabledList.length) parts.push(`<strong>${enabledList.length}</strong> enabled`);
             else if (pipelines.length) parts.push(`${pipelines.length} configured · none enabled`);
             else parts.push('No pipelines yet');
-            const first = enabledList[0];
-            if (first && first.poll_interval_sec) parts.push(`every <strong>${first.poll_interval_sec}s</strong>`);
+            // Schedule = external cron (/api/cron/auto-run), not in-app 300s
+            if (data.cron_enabled) parts.push('cron on');
             const lastResult = pipelines.find(p => p.last_result)?.last_result;
             if (lastResult) parts.push(`last: ${escapeHtml(String(lastResult).slice(0, 48))}`);
             const lastError = pipelines.find(p => p.last_error)?.last_error;
