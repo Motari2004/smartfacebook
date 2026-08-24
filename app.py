@@ -1418,6 +1418,162 @@ def _get_any_bluesky_client():
     return None, None
 
 
+def _client_auth_headers(client):
+    """Bearer token for raw XRPC calls (avoids atproto Pydantic video-embed crashes)."""
+    token = None
+    try:
+        # Common locations across atproto versions
+        for attr in ('_session', 'session', '_me'):
+            sess = getattr(client, attr, None)
+            if sess is None:
+                continue
+            if isinstance(sess, dict):
+                token = sess.get('accessJwt') or sess.get('access_jwt')
+            else:
+                token = getattr(sess, 'access_jwt', None) or getattr(sess, 'accessJwt', None)
+            if token:
+                break
+        if not token and hasattr(client, 'request'):
+            # Some versions store on request session
+            hdrs = getattr(client.request, '_headers', None) or {}
+            auth = hdrs.get('Authorization') or hdrs.get('authorization')
+            if auth and str(auth).lower().startswith('bearer '):
+                token = str(auth).split(' ', 1)[1]
+    except Exception as e:
+        print(f"auth header extract: {e}")
+    if not token:
+        return {}
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+
+def _extract_images_from_embed(embed):
+    """Parse images (and video thumbnails) from a raw embed dict."""
+    images = []
+    if not embed or not isinstance(embed, dict):
+        return images
+    etype = embed.get('$type') or embed.get('py_type') or ''
+
+    # Images embed
+    if 'embed.images' in etype or embed.get('images'):
+        for im in embed.get('images') or []:
+            if not isinstance(im, dict):
+                continue
+            url = im.get('fullsize') or im.get('thumb')
+            if url:
+                images.append({"url": url, "thumb": im.get('thumb') or url})
+
+    # Video embed — use thumbnail as still image for FB photo posts
+    if 'embed.video' in etype:
+        thumb = embed.get('thumbnail')
+        if thumb:
+            images.append({"url": thumb, "thumb": thumb, "is_video_thumb": True})
+
+    # recordWithMedia — nested media
+    media = embed.get('media')
+    if isinstance(media, dict):
+        images.extend(_extract_images_from_embed(media))
+
+    return images
+
+
+def _raw_get_author_feed(client, actor, limit=20):
+    """
+    Fetch author feed via raw HTTP so video embeds don't break atproto Pydantic models.
+    Returns list of normalized post dicts.
+    """
+    actor = (actor or '').strip().lstrip('@')
+    if actor and '.' not in actor:
+        actor = actor + '.bsky.social'
+    limit = max(1, min(int(limit or 20), 50))
+
+    base = 'https://bsky.social'
+    try:
+        # Prefer client's configured host if available
+        host = getattr(getattr(client, 'request', None), 'base_url', None) or getattr(client, '_base_url', None)
+        if host:
+            base = str(host).rstrip('/')
+    except Exception:
+        pass
+
+    url = f"{base}/xrpc/app.bsky.feed.getAuthorFeed"
+    headers = _client_auth_headers(client)
+    # Public AppView also works for many reads without auth
+    params = {"actor": actor, "limit": limit}
+
+    try:
+        r = requests.get(url, headers=headers or None, params=params, timeout=30)
+        if r.status_code == 401 and not headers:
+            # retry against public API
+            r = requests.get(
+                "https://api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed",
+                params=params,
+                timeout=30,
+            )
+        if r.status_code != 200:
+            # Fallback public AppView
+            r2 = requests.get(
+                "https://api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed",
+                params=params,
+                timeout=30,
+            )
+            if r2.status_code == 200:
+                r = r2
+            else:
+                raise RuntimeError(f"getAuthorFeed HTTP {r.status_code}: {r.text[:200]}")
+        data = r.json()
+    except Exception as e:
+        # Last resort: typed client (may fail on video)
+        print(f"raw feed failed ({e}); trying typed client")
+        feed = client.get_author_feed(actor=actor, limit=limit)
+        posts = []
+        for item in feed.feed:
+            post = item.post
+            record = post.record
+            images = []
+            view_embed = getattr(post, 'embed', None)
+            if view_embed:
+                imgs = getattr(view_embed, 'images', None)
+                if imgs:
+                    for im in imgs:
+                        u = getattr(im, 'fullsize', None) or getattr(im, 'thumb', None)
+                        if u:
+                            images.append({"url": u, "thumb": getattr(im, 'thumb', u)})
+            posts.append({
+                "uri": post.uri,
+                "author": post.author.handle if post.author else actor,
+                "display_name": getattr(post.author, 'display_name', None),
+                "text": getattr(record, 'text', '') or '',
+                "images": images,
+                "likes": getattr(post, 'like_count', 0) or 0,
+                "reposts": getattr(post, 'repost_count', 0) or 0,
+                "replies": getattr(post, 'reply_count', 0) or 0,
+                "created_at": getattr(record, 'created_at', None),
+                "is_repost": getattr(item, 'reason', None) is not None,
+            })
+        return posts
+
+    posts = []
+    for item in data.get('feed') or []:
+        post = item.get('post') or {}
+        record = post.get('record') or {}
+        author = post.get('author') or {}
+        embed = post.get('embed') or {}
+        images = _extract_images_from_embed(embed)
+        posts.append({
+            "uri": post.get('uri'),
+            "author": author.get('handle') or actor,
+            "display_name": author.get('displayName') or author.get('handle'),
+            "text": record.get('text') or '',
+            "images": images,
+            "likes": post.get('likeCount') or 0,
+            "reposts": post.get('repostCount') or 0,
+            "replies": post.get('replyCount') or 0,
+            "created_at": record.get('createdAt'),
+            "is_repost": item.get('reason') is not None,
+        })
+    return posts
+
+
 def tool_fetch_posts(session_id, actor, limit=15, media_only=True, include_reposts=False):
     try:
         client, meta = _get_client_for_session(session_id)
@@ -1430,61 +1586,23 @@ def tool_fetch_posts(session_id, actor, limit=15, media_only=True, include_repos
         if '.' not in actor:
             actor = actor + '.bsky.social'
 
-        feed = client.get_author_feed(actor=actor, limit=min(int(limit or 15), 50))
+        raw_posts = _raw_get_author_feed(client, actor, limit=min(int(limit or 15), 50))
         posts = []
-        for item in feed.feed:
-            post = item.post
-            # skip reposts if not wanted
-            if not include_reposts and getattr(item, 'reason', None) is not None:
+        for p in raw_posts:
+            if not include_reposts and p.get('is_repost'):
                 continue
-            record = post.record
-            text = getattr(record, 'text', '') or ''
-            images = []
-            embed = getattr(record, 'embed', None)
-            if embed:
-                images_embed = getattr(embed, 'images', None)
-                if images_embed:
-                    for im in images_embed:
-                        full = getattr(getattr(im, 'image', None), 'ref', None)
-                        # Prefer CDN URLs from post.embed if available
-                        pass
-                # Prefer post.embed view
-            view_embed = getattr(post, 'embed', None)
-            if view_embed:
-                imgs = getattr(view_embed, 'images', None)
-                if imgs:
-                    for im in imgs:
-                        url = getattr(im, 'fullsize', None) or getattr(im, 'thumb', None)
-                        if url:
-                            images.append({"url": url, "thumb": getattr(im, 'thumb', url)})
-                media = getattr(view_embed, 'media', None)
-                if media and hasattr(media, 'images'):
-                    for im in media.images:
-                        url = getattr(im, 'fullsize', None) or getattr(im, 'thumb', None)
-                        if url:
-                            images.append({"url": url, "thumb": getattr(im, 'thumb', url)})
-
-            if media_only and not images:
+            if media_only and not (p.get('images') or []):
                 continue
-
-            uri = post.uri
-            author = post.author.handle if post.author else actor
-            display_name = getattr(post.author, 'display_name', None) or author
-            likes = getattr(post, 'like_count', 0) or 0
-            reposts = getattr(post, 'repost_count', 0) or 0
-            replies = getattr(post, 'reply_count', 0) or 0
-            created = getattr(record, 'created_at', None)
-
             posts.append({
-                "uri": uri,
-                "author": author,
-                "display_name": display_name,
-                "text": text,
-                "images": images,
-                "likes": likes,
-                "reposts": reposts,
-                "replies": replies,
-                "created_at": created,
+                "uri": p.get('uri'),
+                "author": p.get('author'),
+                "display_name": p.get('display_name'),
+                "text": p.get('text') or '',
+                "images": p.get('images') or [],
+                "likes": p.get('likes') or 0,
+                "reposts": p.get('reposts') or 0,
+                "replies": p.get('replies') or 0,
+                "created_at": p.get('created_at'),
             })
 
         if session_id and session_id in sessions:
@@ -1555,22 +1673,80 @@ def tool_add_to_vault(posts, handler_handle=None):
         return {"success": False, "error": str(e)}
 
 
-def tool_list_vault(limit=15):
+def _normalize_pipeline_filter(pipeline=None, handler_handle=None):
+    """Resolve user-facing pipeline/niche name to handler_handle used in vault."""
+    key = (pipeline or handler_handle or '').strip()
+    if not key:
+        return None
+    resolved = _resolve_pipeline_name(key)
+    if resolved:
+        return resolved
+    for c in _list_auto_configs():
+        if (c.get('name') or '').lower() == key.lower():
+            return c.get('name')
+        if (c.get('niche') or '').lower() == key.lower():
+            return c.get('name')
+    return key
+
+
+def _format_vault_list_message(items, total, label="Vault"):
+    if not items:
+        return f"{label}: empty."
+    lines = [f"📦 {label} — showing {len(items)} of {total}:"]
+    for it in items:
+        imgs = it.get('images') or []
+        if isinstance(imgs, str):
+            try:
+                imgs = json.loads(imgs)
+            except Exception:
+                imgs = []
+        nimg = len(imgs) if isinstance(imgs, list) else 0
+        text = (it.get('text') or '').strip()
+        if len(text) > 70:
+            text = text[:70] + "…"
+        if not text:
+            text = "(image only)" if nimg else "(no text)"
+        media = f" 📸{nimg}" if nimg else ""
+        lines.append(f"  #{it.get('id')} @{it.get('author')}: {text}{media}")
+    return "\n".join(lines)
+
+
+def tool_list_vault(limit=15, pipeline=None, handler_handle=None):
+    """List vault items. Optional pipeline filters one reserve (e.g. wildlife)."""
     try:
         conn = get_db_connection()
         if not conn:
             return {"success": False, "error": "DB unavailable"}
         cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("""
-            SELECT id, uri, author, display_name, text, images, likes, reposts, replies,
-                   created_at, saved_at, handler_handle, notes
-            FROM vault
-            ORDER BY saved_at DESC
-            LIMIT %s
-        """, (int(limit or 15),))
-        rows = cur.fetchall()
-        cur.execute("SELECT COUNT(*) FROM vault")
-        total = cur.fetchone()['count']
+        limit = int(limit or 15)
+        hh = _normalize_pipeline_filter(pipeline, handler_handle)
+
+        if hh:
+            cur.execute("""
+                SELECT id, uri, author, display_name, text, images, likes, reposts, replies,
+                       created_at, saved_at, handler_handle, notes
+                FROM vault
+                WHERE handler_handle = %s
+                ORDER BY saved_at DESC
+                LIMIT %s
+            """, (hh, limit))
+            rows = cur.fetchall()
+            cur.execute("SELECT COUNT(*) AS count FROM vault WHERE handler_handle = %s", (hh,))
+            total = cur.fetchone()['count']
+            label = f"Vault / reserve «{hh}»"
+        else:
+            cur.execute("""
+                SELECT id, uri, author, display_name, text, images, likes, reposts, replies,
+                       created_at, saved_at, handler_handle, notes
+                FROM vault
+                ORDER BY saved_at DESC
+                LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
+            cur.execute("SELECT COUNT(*) AS count FROM vault")
+            total = cur.fetchone()['count']
+            label = "Vault"
+
         cur.close()
         conn.close()
         vault = []
@@ -1582,53 +1758,80 @@ def tool_list_vault(limit=15):
                 except Exception:
                     pass
             vault.append(item)
-        return {"success": True, "vault": vault, "count": total}
+        return {
+            "success": True,
+            "vault": vault,
+            "count": total,
+            "pipeline": hh,
+            "message": _format_vault_list_message(vault, total, label),
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
-def tool_list_vault_by_status(status='all', limit=50):
+def tool_list_vault_by_status(status='all', limit=50, pipeline=None, handler_handle=None):
+    """List vault by status; optional pipeline filters that niche's reserve."""
     try:
         conn = get_db_connection()
         if not conn:
             return {"success": False, "error": "DB unavailable"}
         cur = conn.cursor(cursor_factory=RealDictCursor)
         limit = int(limit or 50)
+        hh = _normalize_pipeline_filter(pipeline, handler_handle)
+        status = (status or 'all').lower()
+
+        where = []
+        params = []
+        if hh:
+            where.append("v.handler_handle = %s")
+            params.append(hh)
+
         if status == 'unposted':
-            cur.execute("""
-                SELECT v.* FROM vault v
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM posted_posts p
-                    WHERE p.uri = v.uri AND p.platform = 'facebook'
-                      AND p.status IN ('completed', 'posted', 'scheduled')
-                )
-                ORDER BY v.saved_at DESC LIMIT %s
-            """, (limit,))
+            where.append("""NOT EXISTS (
+                SELECT 1 FROM posted_posts p
+                WHERE p.uri = v.uri AND p.platform = 'facebook'
+                  AND p.status IN ('completed', 'posted', 'scheduled')
+            )""")
         elif status == 'posted':
-            cur.execute("""
-                SELECT v.* FROM vault v
-                WHERE EXISTS (
-                    SELECT 1 FROM posted_posts p
-                    WHERE p.uri = v.uri AND p.platform = 'facebook'
-                      AND p.status IN ('completed', 'posted')
-                )
-                ORDER BY v.saved_at DESC LIMIT %s
-            """, (limit,))
+            where.append("""EXISTS (
+                SELECT 1 FROM posted_posts p
+                WHERE p.uri = v.uri AND p.platform = 'facebook'
+                  AND p.status IN ('completed', 'posted')
+            )""")
         elif status == 'scheduled':
-            cur.execute("""
-                SELECT v.* FROM vault v
-                WHERE EXISTS (
-                    SELECT 1 FROM posted_posts p
-                    WHERE p.uri = v.uri AND p.platform = 'facebook' AND p.status = 'scheduled'
-                )
-                ORDER BY v.saved_at DESC LIMIT %s
-            """, (limit,))
-        else:
-            cur.execute("SELECT * FROM vault ORDER BY saved_at DESC LIMIT %s", (limit,))
+            where.append("""EXISTS (
+                SELECT 1 FROM posted_posts p
+                WHERE p.uri = v.uri AND p.platform = 'facebook' AND p.status = 'scheduled'
+            )""")
+
+        sql_where = ("WHERE " + " AND ".join(where)) if where else ""
+        cur.execute(
+            f"SELECT v.* FROM vault v {sql_where} ORDER BY v.saved_at DESC LIMIT %s",
+            params + [limit],
+        )
         rows = [dict(r) for r in cur.fetchall()]
+        for item in rows:
+            if item.get('images') and isinstance(item['images'], str):
+                try:
+                    item['images'] = json.loads(item['images'])
+                except Exception:
+                    pass
         cur.close()
         conn.close()
-        return {"success": True, "vault": rows, "count": len(rows), "status": status}
+
+        label_bits = []
+        if hh:
+            label_bits.append(f"«{hh}»")
+        label_bits.append(status)
+        label = "Vault " + " · ".join(label_bits)
+        return {
+            "success": True,
+            "vault": rows,
+            "count": len(rows),
+            "status": status,
+            "pipeline": hh,
+            "message": _format_vault_list_message(rows, len(rows), label),
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -2183,42 +2386,26 @@ def _run_one_pipeline(cfg):
             actor = src.lstrip('@')
             if '.' not in actor:
                 actor = actor + '.bsky.social'
-            feed = client.get_author_feed(actor=actor, limit=20)
-            for item in feed.feed:
-                if not include_reposts and getattr(item, 'reason', None) is not None:
+            # Raw XRPC — avoids atproto Pydantic crash on app.bsky.embed.video#view
+            for p in _raw_get_author_feed(client, actor, limit=20):
+                if not include_reposts and p.get('is_repost'):
                     continue
-                post = item.post
-                uri = post.uri
-                if _seen_uri(name, uri):
+                uri = p.get('uri')
+                if not uri or _seen_uri(name, uri):
                     continue
-                images = []
-                view_embed = getattr(post, 'embed', None)
-                if view_embed:
-                    imgs = getattr(view_embed, 'images', None)
-                    if imgs:
-                        for im in imgs:
-                            url = getattr(im, 'fullsize', None) or getattr(im, 'thumb', None)
-                            if url:
-                                images.append({"url": url, "thumb": getattr(im, 'thumb', url)})
-                    media = getattr(view_embed, 'media', None)
-                    if media and hasattr(media, 'images'):
-                        for im in media.images:
-                            url = getattr(im, 'fullsize', None) or getattr(im, 'thumb', None)
-                            if url:
-                                images.append({"url": url, "thumb": getattr(im, 'thumb', url)})
+                images = p.get('images') or []
                 if media_only and not images:
                     continue
-                record = post.record
                 fetched_posts.append({
                     "uri": uri,
-                    "author": post.author.handle if post.author else actor,
-                    "display_name": getattr(post.author, 'display_name', None),
-                    "text": getattr(record, 'text', '') or '',
+                    "author": p.get('author') or actor,
+                    "display_name": p.get('display_name'),
+                    "text": p.get('text') or '',
                     "images": images,
-                    "likes": getattr(post, 'like_count', 0) or 0,
-                    "reposts": getattr(post, 'repost_count', 0) or 0,
-                    "replies": getattr(post, 'reply_count', 0) or 0,
-                    "created_at": getattr(record, 'created_at', None),
+                    "likes": p.get('likes') or 0,
+                    "reposts": p.get('reposts') or 0,
+                    "replies": p.get('replies') or 0,
+                    "created_at": p.get('created_at'),
                 })
         except Exception as e:
             print(f"fetch {src}: {e}")
@@ -2353,31 +2540,23 @@ def tool_master_fetch_niche(name=None, limit_per_source=20):
         if '.' not in actor:
             actor = actor + '.bsky.social'
         try:
-            feed = client.get_author_feed(actor=actor, limit=int(limit_per_source or 20))
-            for item in feed.feed:
-                post = item.post
-                images = []
-                view_embed = getattr(post, 'embed', None)
-                if view_embed:
-                    imgs = getattr(view_embed, 'images', None)
-                    if imgs:
-                        for im in imgs:
-                            url = getattr(im, 'fullsize', None) or getattr(im, 'thumb', None)
-                            if url:
-                                images.append({"url": url, "thumb": getattr(im, 'thumb', url)})
+            # Raw XRPC — video embeds (app.bsky.embed.video#view) no longer crash fetch
+            for p in _raw_get_author_feed(client, actor, limit=int(limit_per_source or 20)):
+                images = p.get('images') or []
                 if cfg.get('media_only', True) and not images:
                     continue
-                record = post.record
+                if not p.get('uri'):
+                    continue
                 all_posts.append({
-                    "uri": post.uri,
-                    "author": post.author.handle if post.author else actor,
-                    "display_name": getattr(post.author, 'display_name', None),
-                    "text": getattr(record, 'text', '') or '',
+                    "uri": p.get('uri'),
+                    "author": p.get('author') or actor,
+                    "display_name": p.get('display_name'),
+                    "text": p.get('text') or '',
                     "images": images,
-                    "likes": getattr(post, 'like_count', 0) or 0,
-                    "reposts": getattr(post, 'repost_count', 0) or 0,
-                    "replies": getattr(post, 'reply_count', 0) or 0,
-                    "created_at": getattr(record, 'created_at', None),
+                    "likes": p.get('likes') or 0,
+                    "reposts": p.get('reposts') or 0,
+                    "replies": p.get('replies') or 0,
+                    "created_at": p.get('created_at'),
                 })
         except Exception as e:
             print(f"master fetch {src}: {e}")
@@ -2527,10 +2706,20 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "list_vault",
-            "description": "List vault items",
+            "description": "List vault items. Pass pipeline to filter one niche reserve (e.g. wildlife).",
             "parameters": {
                 "type": "object",
-                "properties": {"limit": {"type": "integer", "default": 15}},
+                "properties": {
+                    "limit": {"type": "integer", "default": 15},
+                    "pipeline": {
+                        "type": "string",
+                        "description": "Pipeline/niche name, e.g. wildlife",
+                    },
+                    "handler_handle": {
+                        "type": "string",
+                        "description": "Same as pipeline — vault handler_handle filter",
+                    },
+                },
             },
         },
     },
@@ -2538,12 +2727,17 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "list_vault_by_status",
-            "description": "List vault by status: unposted, posted, scheduled, all",
+            "description": "List vault by status (unposted/posted/scheduled/all). Optional pipeline filters that niche reserve.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "status": {"type": "string", "enum": ["unposted", "posted", "scheduled", "all"]},
                     "limit": {"type": "integer", "default": 50},
+                    "pipeline": {
+                        "type": "string",
+                        "description": "Pipeline/niche name e.g. wildlife",
+                    },
+                    "handler_handle": {"type": "string"},
                 },
             },
         },
@@ -2750,11 +2944,17 @@ def execute_tool(name, args, session_id=None):
                 handler_handle=sessions.get(session_id, {}).get('_last_actor'),
             )
         if name == 'list_vault':
-            return tool_list_vault(limit=int(args.get('limit') or 15))
+            return tool_list_vault(
+                limit=int(args.get('limit') or 15),
+                pipeline=args.get('pipeline'),
+                handler_handle=args.get('handler_handle'),
+            )
         if name == 'list_vault_by_status':
             return tool_list_vault_by_status(
                 status=args.get('status', 'all'),
                 limit=int(args.get('limit', 50)),
+                pipeline=args.get('pipeline'),
+                handler_handle=args.get('handler_handle'),
             )
         if name == 'delete_vault_items':
             if args.get('all') and args.get('confirm') != 'YES_DELETE_ALL':
@@ -2835,6 +3035,13 @@ You can:
 - list pipelines / start pipeline NAME / stop pipeline NAME / auto status
 - Master-fetch fills a pipeline's vault reserve
 
+VAULT / RESERVE:
+- "list vault" → list_vault()
+- "show wildlife vault" or "posts in wildlife reserve" → list_vault(pipeline="wildlife")
+- "unposted in wildlife" → list_vault_by_status(status="unposted", pipeline="wildlife")
+- "list unposted" → list_vault_by_status(status="unposted")
+Always pass pipeline when the user names a niche/pipeline (e.g. wildlife).
+
 Be concise. Timezone for schedules: Africa/Nairobi (GMT+3).
 """
 
@@ -2877,15 +3084,53 @@ def simple_fallback(msg, session_id):
         r = tool_get_status()
         return r.get('message', str(r))
 
+    # Reserve / pipeline-scoped vault
+    if any(w in lower for w in ('reserve', 'wildlife')) or (
+        ('vault' in lower or 'unposted' in lower) and any(
+            w in lower for w in ('list', 'show', 'what', 'see', 'posts in')
+        )
+    ):
+        # Detect pipeline name from known configs or common words
+        pipe = None
+        for c in _list_auto_configs():
+            n = (c.get('name') or '')
+            if n and n.lower() in lower:
+                pipe = n
+                break
+        if not pipe:
+            m = re.search(
+                r'(?:in|for|of)\s+(?:the\s+)?([a-zA-Z0-9._-]+)\s+(?:vault|reserve|pipeline|niche)',
+                msg, re.I,
+            )
+            if m:
+                pipe = m.group(1)
+            else:
+                m2 = re.search(
+                    r'(?:vault|reserve|pipeline|niche)\s+(?:for\s+|named\s+)?([a-zA-Z0-9._-]+)',
+                    msg, re.I,
+                )
+                if m2:
+                    pipe = m2.group(1)
+        if 'wildlife' in lower and not pipe:
+            pipe = 'wildlife'
+
+        status = 'all'
+        if 'unposted' in lower:
+            status = 'unposted'
+        elif 'posted' in lower and 'unposted' not in lower:
+            status = 'posted'
+        elif 'scheduled' in lower:
+            status = 'scheduled'
+
+        if status != 'all' or pipe:
+            r = tool_list_vault_by_status(status=status if status != 'all' else 'all', limit=15, pipeline=pipe)
+        else:
+            r = tool_list_vault(limit=15, pipeline=pipe)
+        return r.get('message') or r.get('error') or str(r)
+
     if 'vault' in lower and any(w in lower for w in ('list', 'show', 'what')):
         r = tool_list_vault(limit=10)
-        items = r.get('vault') or []
-        if not items:
-            return "Vault is empty."
-        lines = [f"Vault ({r.get('count')} items):"]
-        for i, it in enumerate(items, 1):
-            lines.append(f"{i}. id={it.get('id')} @{it.get('author')}: {(it.get('text') or '')[:80]}")
-        return "\n".join(lines)
+        return r.get('message') or r.get('error') or str(r)
 
     if 'account' in lower and 'api' not in lower:
         r = tool_list_accounts('facebook')
