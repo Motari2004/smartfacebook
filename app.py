@@ -2411,6 +2411,7 @@ def tool_auto_set_destination(name, account_username=None, account_id=None):
 
 
 def tool_auto_start(name=None):
+    """Enable pipeline(s), persist cron_enabled=true in DB (survives restarts)."""
     global _auto_running
     configs = _list_auto_configs()
     if not configs:
@@ -2429,13 +2430,21 @@ def tool_auto_start(name=None):
             _save_auto_config(c)
         names = [c.get('name') for c in configs]
 
+    # Persist so Vercel/cron and restarts keep treating auto as ON
     set_cron_state(True)
+    pilot = None
     if not IS_VERCEL:
-        start_auto_pilot()
+        pilot = start_auto_pilot()
+    msg = f"Started pipeline(s): {', '.join(names)} · cron enabled in DB"
+    if IS_VERCEL:
+        msg += " · use GET /api/cron/auto-run on a schedule"
+    elif pilot and not pilot.get('success'):
+        msg += f" · pilot: {pilot.get('message')}"
     return {
         "success": True,
-        "message": f"Started pipeline(s): {', '.join(names)}",
+        "message": msg,
         "pipelines": names,
+        "cron_enabled": True,
     }
 
 
@@ -2504,15 +2513,19 @@ def tool_auto_status():
             "niche": c.get('niche'),
         })
     enabled = [p for p in pipelines if p['enabled']]
+    cron_on = get_cron_state()
+    # "running" = pipelines enabled + (background thread OR cron flag in DB)
+    # so Start on a pipeline shows ON even on Vercel where only cron ticks
+    is_on = bool(enabled) and (bool(_auto_running) or cron_on)
     return {
         "success": True,
-        "running": bool(_auto_running and enabled),
-        "cron_enabled": get_cron_state(),
+        "running": is_on,
+        "cron_enabled": cron_on,
         "pipelines": pipelines,
         "enabled_count": len(enabled),
         "message": (
-            f"Auto {'ON' if (_auto_running and enabled) else 'idle'} · "
-            f"{len(enabled)}/{len(pipelines)} enabled"
+            f"Auto {'ON' if is_on else 'idle'} · "
+            f"{len(enabled)}/{len(pipelines)} enabled · cron={'yes' if cron_on else 'no'}"
         ),
     }
 
@@ -2554,6 +2567,12 @@ def _mark_seen(config_name, uri, posted=False):
 
 
 def _run_one_pipeline(cfg):
+    """
+    Instagram-style cycle:
+      1) Check Bluesky sources for NEW posts → vault → post them
+      2) If not enough new posts, fill the rest from niche vault reserve
+    Cron/enabled state is persisted in DB (app_settings + auto_config.enabled).
+    """
     name = cfg.get('name') or 'default'
     sources = cfg.get('source_handles') or []
     if not sources and cfg.get('source_handle'):
@@ -2569,9 +2588,79 @@ def _run_one_pipeline(cfg):
     content_type = cfg.get('content_type') or 'feed'
     can_post = bool(account_username or account_id)
 
-    # Prefer unposted reserve tagged with this pipeline name
+    if not can_post:
+        print(f"Pipeline {name}: no FB destination — fetch only into vault")
+
+    # ---------- 1) NEW posts from Bluesky ----------
+    posted_new = 0
+    fetched_posts = []
+    client, _meta = _get_any_bluesky_client()
+    if client:
+        for src in sources:
+            try:
+                actor = src.lstrip('@')
+                if '.' not in actor:
+                    actor = actor + '.bsky.social'
+                for p in _raw_get_author_feed(client, actor, limit=40, max_pages=3):
+                    if not include_reposts and p.get('is_repost'):
+                        continue
+                    uri = p.get('uri')
+                    if not uri or _seen_uri(name, uri):
+                        continue
+                    images = p.get('images') or []
+                    if media_only and not images:
+                        continue
+                    fetched_posts.append({
+                        "uri": uri,
+                        "author": p.get('author') or actor,
+                        "display_name": p.get('display_name'),
+                        "text": p.get('text') or '',
+                        "images": images,
+                        "likes": p.get('likes') or 0,
+                        "reposts": p.get('reposts') or 0,
+                        "replies": p.get('replies') or 0,
+                        "created_at": p.get('created_at'),
+                    })
+            except Exception as e:
+                print(f"fetch {src}: {e}")
+
+        if fetched_posts:
+            tool_add_to_vault(fetched_posts, handler_handle=name)
+
+        if can_post:
+            for p in fetched_posts[:max_posts]:
+                _mark_seen(name, p['uri'], posted=False)
+                try:
+                    conn = get_db_connection()
+                    cur = conn.cursor()
+                    cur.execute("SELECT id FROM vault WHERE uri = %s", (p['uri'],))
+                    row = cur.fetchone()
+                    cur.close()
+                    conn.close()
+                    vid = row[0] if row else None
+                except Exception:
+                    vid = None
+                if vid:
+                    res = tool_post_now(
+                        vault_id=vid,
+                        account_username=account_username,
+                        account_id=account_id,
+                        content_type=content_type,
+                    )
+                    if res.get('success'):
+                        posted_new += 1
+                        _mark_seen(name, p['uri'], posted=True)
+        else:
+            for p in fetched_posts:
+                if p.get('uri'):
+                    _mark_seen(name, p['uri'], posted=False)
+    else:
+        print(f"Pipeline {name}: no Bluesky session — will use vault reserve only")
+
+    # ---------- 2) Fill from vault reserve if not enough new ----------
     posted_from_reserve = 0
-    if can_post:
+    remaining = max(0, max_posts - posted_new)
+    if can_post and remaining > 0:
         try:
             conn = get_db_connection()
             if conn:
@@ -2586,7 +2675,7 @@ def _run_one_pipeline(cfg):
                     )
                     ORDER BY v.saved_at ASC
                     LIMIT %s
-                """, (name, max_posts))
+                """, (name, remaining))
                 reserve = cur.fetchall()
                 cur.close()
                 conn.close()
@@ -2602,98 +2691,18 @@ def _run_one_pipeline(cfg):
                         _mark_seen(name, item.get('uri'), posted=True)
         except Exception as e:
             print(f"reserve post: {e}")
-    else:
-        print(f"Pipeline {name}: no FB destination — will only fetch into vault reserve")
 
-    if posted_from_reserve >= max_posts:
-        msg = f"Posted {posted_from_reserve} from reserve"
-        cfg['last_result'] = msg
+    total = posted_new + posted_from_reserve
+    if can_post:
+        msg = f"Posted {total} (new={posted_new}, reserve={posted_from_reserve})"
         cfg['last_error'] = None
-        cfg['last_run_at'] = datetime.now()
-        _save_auto_config(cfg)
-        return {"success": True, "posted": posted_from_reserve, "message": msg}
-
-    remaining = max_posts - posted_from_reserve
-    client, _meta = _get_any_bluesky_client()
-    if not client:
-        msg = f"Posted {posted_from_reserve} from reserve; no Bluesky session for fetch"
-        cfg['last_result'] = msg
-        cfg['last_error'] = "No Bluesky session"
-        cfg['last_run_at'] = datetime.now()
-        _save_auto_config(cfg)
-        return {"success": posted_from_reserve > 0, "posted": posted_from_reserve, "message": msg}
-
-    fetched_posts = []
-    for src in sources:
-        try:
-            actor = src.lstrip('@')
-            if '.' not in actor:
-                actor = actor + '.bsky.social'
-            # Raw XRPC — avoids atproto Pydantic crash on app.bsky.embed.video#view
-            for p in _raw_get_author_feed(client, actor, limit=40, max_pages=3):
-                if not include_reposts and p.get('is_repost'):
-                    continue
-                uri = p.get('uri')
-                if not uri or _seen_uri(name, uri):
-                    continue
-                images = p.get('images') or []
-                if media_only and not images:
-                    continue
-                fetched_posts.append({
-                    "uri": uri,
-                    "author": p.get('author') or actor,
-                    "display_name": p.get('display_name'),
-                    "text": p.get('text') or '',
-                    "images": images,
-                    "likes": p.get('likes') or 0,
-                    "reposts": p.get('reposts') or 0,
-                    "replies": p.get('replies') or 0,
-                    "created_at": p.get('created_at'),
-                })
-        except Exception as e:
-            print(f"fetch {src}: {e}")
-
-    if fetched_posts:
-        tool_add_to_vault(fetched_posts, handler_handle=name)
-
-    posted_new = 0
-    if can_post:
-        for p in fetched_posts[:remaining]:
-            _mark_seen(name, p['uri'], posted=False)
-            try:
-                conn = get_db_connection()
-                cur = conn.cursor()
-                cur.execute("SELECT id FROM vault WHERE uri = %s", (p['uri'],))
-                row = cur.fetchone()
-                cur.close()
-                conn.close()
-                vid = row[0] if row else None
-            except Exception:
-                vid = None
-            if vid:
-                res = tool_post_now(
-                    vault_id=vid,
-                    account_username=account_username,
-                    account_id=account_id,
-                    content_type=content_type,
-                )
-                if res.get('success'):
-                    posted_new += 1
-                    _mark_seen(name, p['uri'], posted=True)
-    else:
-        for p in fetched_posts:
-            if p.get('uri'):
-                _mark_seen(name, p['uri'], posted=False)
-
-    total = posted_from_reserve + posted_new
-    if can_post:
-        msg = f"Posted {total} (reserve={posted_from_reserve}, new={posted_new})"
     else:
         msg = f"Fetched {len(fetched_posts)} into vault (no FB destination yet)"
+        cfg['last_error'] = "No Facebook destination"
     cfg['last_result'] = msg
-    cfg['last_error'] = None if can_post else "No Facebook destination"
     cfg['last_run_at'] = datetime.now()
     _save_auto_config(cfg)
+    print(f"🤖 Pipeline {name}: {msg}")
     return {"success": True, "posted": total, "message": msg}
 
 
