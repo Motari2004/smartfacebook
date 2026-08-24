@@ -382,7 +382,32 @@ def get_zernio_headers():
     return {}
 
 
-def get_zernio_headers_for_account(account_username=None):
+def get_zernio_headers_for_account(account_username=None, account_id=None):
+    """Get the correct Zernio headers for a specific account."""
+    
+    # First try by account_id
+    if account_id:
+        conn = get_db_connection()
+        if conn:
+            try:
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT api_key FROM zernio_accounts
+                    WHERE account_id = %s AND platform = 'facebook' AND is_active = TRUE
+                    LIMIT 1
+                """, (account_id,))
+                row = cur.fetchone()
+                cur.close()
+                conn.close()
+                if row and row[0]:
+                    return get_zernio_headers_for_key(row[0])
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    
+    # Then try by username
     if account_username:
         conn = get_db_connection()
         if conn:
@@ -403,6 +428,8 @@ def get_zernio_headers_for_account(account_username=None):
                     conn.close()
                 except Exception:
                     pass
+    
+    # Fallback to first key
     return get_zernio_headers()
 
 
@@ -1158,9 +1185,16 @@ def create_facebook_post(text, account_id, media_urls=None, scheduled_for=None,
         else:
             payload["publishNow"] = True
 
+        # ✅ FIX: Get the correct headers for this specific account
+        headers = get_zernio_headers_for_account(account_id=account_id)
+        if not headers:
+            # Fallback to first key if account not found
+            headers = get_zernio_headers()
+            print(f"⚠️ No specific key for account {account_id}, using fallback")
+
         response = requests.post(
             f"{ZERNIO_BASE_URL}/posts",
-            headers=get_zernio_headers(),
+            headers=headers,
             json=payload,
             timeout=30,
         )
