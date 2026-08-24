@@ -24,10 +24,7 @@
             --safe-bottom: env(safe-area-inset-bottom, 0px);
         }
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        html, body {
-            height: 100%;
-            height: 100dvh;
-        }
+        html, body { height: 100%; height: 100dvh; }
         body {
             font-family: 'Inter', system-ui, sans-serif;
             background: var(--bg);
@@ -36,8 +33,6 @@
             overflow: hidden;
             -webkit-tap-highlight-color: transparent;
         }
-
-        /* ===== SIDEBAR ===== */
         .sidebar {
             width: 280px;
             background: var(--card);
@@ -55,8 +50,6 @@
         }
         .sidebar::-webkit-scrollbar { width: 5px; }
         .sidebar::-webkit-scrollbar-thumb { background: #333; border-radius: 10px; }
-
-        /* ===== SIDEBAR OVERLAY + TOGGLE ===== */
         .sidebar-overlay {
             display: none;
             position: fixed;
@@ -66,21 +59,16 @@
             opacity: 0;
             transition: opacity 0.3s ease;
         }
-        .sidebar-overlay.active {
-            display: block;
-            opacity: 1;
-        }
+        .sidebar-overlay.active { display: block; opacity: 1; }
         .sidebar-toggle {
             display: none;
             position: fixed;
-            top: 12px;
-            left: 12px;
+            top: 12px; left: 12px;
             z-index: 101;
             background: var(--card);
             border: 1px solid var(--border);
             color: var(--text);
-            width: 44px;
-            height: 44px;
+            width: 44px; height: 44px;
             border-radius: 12px;
             font-size: 18px;
             cursor: pointer;
@@ -90,7 +78,6 @@
             box-shadow: 0 4px 20px rgba(0,0,0,0.5);
         }
         .sidebar-toggle:active { transform: scale(0.95); }
-
         .logo {
             display: flex;
             align-items: center;
@@ -140,7 +127,6 @@
             flex-shrink: 0;
         }
         .sidebar-actions button { width: 100%; justify-content: center; }
-
         .main {
             flex: 1;
             display: flex;
@@ -161,7 +147,6 @@
         }
         .chat-header h2 { font-size: 15px; font-weight: 600; }
         .chat-header .sub { font-size: 12px; color: var(--text-muted); }
-
         .messages {
             flex: 1;
             overflow-y: auto;
@@ -176,7 +161,6 @@
         }
         .messages::-webkit-scrollbar { width: 6px; }
         .messages::-webkit-scrollbar-thumb { background: #333; border-radius: 10px; }
-
         .msg {
             max-width: 720px;
             display: flex;
@@ -195,6 +179,10 @@
             font-size: 14px; flex-shrink: 0; font-weight: 700;
         }
         .msg.user .avatar { background: #333; }
+        .msg .avatar.ai-avatar {
+            background: linear-gradient(135deg, #1877f2, #8b5cf6);
+            box-shadow: 0 0 20px rgba(24,119,242,0.2);
+        }
         .msg .bubble {
             background: var(--card);
             border: 1px solid var(--border);
@@ -220,11 +208,6 @@
             margin-bottom: 8px;
             font-weight: 600;
         }
-        .msg .avatar.ai-avatar {
-            background: linear-gradient(135deg, #1877f2, #8b5cf6);
-            box-shadow: 0 0 20px rgba(24,119,242,0.2);
-        }
-
         .typing {
             display: none;
             align-items: center;
@@ -248,24 +231,21 @@
             0%, 80%, 100% { transform: translateY(0); }
             40% { transform: translateY(-5px); }
         }
-
-        /* ===== COMPOSER (lifted + curved) ===== */
-.composer {
-    padding: 10px 16px 16px;
-    padding-bottom: calc(16px + var(--safe-bottom));
-    border-top: 1px solid var(--border);
-    background: var(--card);
-    flex-shrink: 0;
-}
-
-
+        .composer {
+            padding: 14px 20px 20px;
+            padding-bottom: calc(18px + var(--safe-bottom));
+            border-top: 1px solid var(--border);
+            background: var(--card);
+            flex-shrink: 0;
+            position: relative;
+        }
         .composer-inner {
             display: flex;
             gap: 10px;
             align-items: center;
             background: var(--bg);
             border: 1.5px solid var(--border);
-            border-radius: 24px;          /* curved */
+            border-radius: 24px;
             padding: 6px 6px 6px 14px;
             transition: all 0.3s ease;
             min-height: 50px;
@@ -275,8 +255,8 @@
             border-color: var(--accent);
             box-shadow: 0 0 0 4px rgba(24,119,242,0.08), 0 4px 20px rgba(0,0,0,0.3);
         }
+        .composer-inner .input-wrapper { flex: 1; min-width: 0; position: relative; }
         .composer textarea {
-            flex: 1;
             width: 100%;
             background: transparent;
             border: none;
@@ -290,15 +270,13 @@
             outline: none;
             padding: 8px 4px;
             -webkit-appearance: none;
-            min-width: 0;
         }
         .composer button.send {
             background: linear-gradient(135deg, #1877f2, #0d65d9);
             color: #fff;
             border: none;
-            border-radius: 50%;           /* circular */
-            width: 42px;
-            height: 42px;
+            border-radius: 50%;
+            width: 42px; height: 42px;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -314,7 +292,6 @@
         }
         .composer button.send:active:not(:disabled) { transform: scale(0.92); }
         .composer button.send:disabled { opacity: 0.3; cursor: not-allowed; box-shadow: none; }
-
         .btn {
             display: inline-flex;
             align-items: center;
@@ -337,7 +314,6 @@
         }
         .btn-secondary:hover { background: var(--border); color: var(--text); }
         .btn-secondary:active { transform: scale(0.97); }
-
         .empty-state {
             flex: 1;
             display: flex;
@@ -351,7 +327,6 @@
         .empty-state i { font-size: 42px; margin-bottom: 16px; opacity: 0.35; }
         .empty-state h3 { color: var(--text-secondary); margin-bottom: 8px; font-weight: 600; }
         .empty-state p { font-size: 14px; max-width: 360px; line-height: 1.5; }
-
         .live-dot {
             display: inline-block;
             width: 9px; height: 9px;
@@ -370,7 +345,6 @@
             70% { box-shadow: 0 0 0 8px rgba(34,197,94,0); }
             100% { box-shadow: 0 0 0 0 rgba(34,197,94,0); }
         }
-
         .auto-banner {
             margin: 0 16px 12px;
             padding: 14px;
@@ -451,7 +425,6 @@
             font-family: 'JetBrains Mono', monospace;
         }
         .pipe-empty { color: var(--text-muted); font-size: 11px; padding: 6px 4px; }
-
         .header-auto {
             margin-left: auto;
             display: flex;
@@ -471,7 +444,6 @@
             color: var(--success);
             background: rgba(34,197,94,0.08);
         }
-
         .toast {
             position: fixed;
             bottom: calc(110px + var(--safe-bottom));
@@ -493,7 +465,6 @@
             from { opacity: 0; transform: translateX(-50%) translateY(20px); }
             to { opacity: 1; transform: translateX(-50%) translateY(0); }
         }
-
         .post-images {
             display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px;
         }
@@ -518,11 +489,30 @@
             align-items: center;
             gap: 12px;
         }
-
-        /* ===== RESPONSIVE ===== */
+        .back-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 12px;
+            font-weight: 500;
+            padding: 6px 12px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            transition: all 0.2s ease;
+            margin-right: 8px;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+        .back-link:hover {
+            color: var(--text);
+            border-color: var(--accent);
+            background: rgba(24,119,242,0.08);
+        }
+        .back-link i { font-size: 12px; }
         @media (max-width: 768px) {
             .sidebar-toggle { display: flex !important; }
-
             .sidebar {
                 position: fixed;
                 top: 0; left: 0; bottom: 0;
@@ -533,7 +523,6 @@
             }
             .sidebar.open { transform: translateX(0); }
             .sidebar-overlay.active { display: block; }
-
             .chat-header {
                 padding: 12px 16px;
                 padding-left: 60px;
@@ -542,68 +531,43 @@
             .chat-header h2 { font-size: 14px; }
             .chat-header .sub { display: none; }
             .header-auto { font-size: 11px; padding: 4px 10px; }
-
             .messages { padding: 14px 12px 8px; gap: 12px; }
             .msg { max-width: 95%; }
             .msg .bubble { font-size: 13px; padding: 10px 13px; }
             .msg .avatar { width: 30px; height: 30px; font-size: 13px; }
-
-            /* Lifted + curved composer */
             .composer {
                 padding: 10px 12px 18px;
                 padding-bottom: calc(20px + var(--safe-bottom));
                 background: linear-gradient(180deg, transparent 0%, var(--card) 12%);
-            }
-            .quick-btn {
-                font-size: 10px;
-                padding: 5px 11px;
-                min-height: 32px;
-                border-radius: 18px;
             }
             .composer-inner {
                 min-height: 50px;
                 border-radius: 26px;
                 padding: 6px 6px 6px 16px;
             }
-            .composer textarea {
-                font-size: 16px;          /* prevents iOS zoom */
-                padding: 8px 4px;
-            }
-            .composer button.send {
-                width: 42px;
-                height: 42px;
-            }
-
+            .composer textarea { font-size: 16px; padding: 8px 4px; }
+            .composer button.send { width: 42px; height: 42px; }
             .empty-state i { font-size: 32px; }
             .empty-state h3 { font-size: 15px; }
             .empty-state p { font-size: 13px; }
-
             .status-card { margin: 12px; padding: 12px; font-size: 12px; }
             .sidebar-actions button { font-size: 12px; padding: 8px 12px; min-height: 38px; }
             .auto-banner { margin: 0 12px 10px; padding: 12px; min-height: 70px; font-size: 11px; }
-
             .toast { bottom: calc(115px + var(--safe-bottom)); }
             .post-images .image-wrapper { max-width: 140px; }
             .post-images .image-wrapper img { max-height: 140px; }
+            .back-link { font-size: 10px; padding: 4px 8px; margin-right: 4px; }
+            .chat-header { padding-left: 48px; gap: 4px; flex-wrap: nowrap; }
+            .chat-header h2 { font-size: 11px !important; }
         }
-
         @media (max-width: 480px) {
             .sidebar { width: 270px; }
-            .sidebar-toggle {
-                top: 8px; left: 8px;
-                width: 38px; height: 38px;
-                font-size: 15px;
-            }
-            .chat-header {
-                padding: 10px 12px;
-                padding-left: 54px;
-                min-height: 48px;
-            }
+            .sidebar-toggle { top: 8px; left: 8px; width: 38px; height: 38px; font-size: 15px; }
+            .chat-header { padding: 10px 12px; padding-left: 54px; min-height: 48px; }
             .chat-header h2 { font-size: 13px; }
             .messages { padding: 10px 10px 6px; gap: 10px; }
             .msg .bubble { font-size: 13px; padding: 9px 12px; }
             .msg .avatar { width: 26px; height: 26px; font-size: 12px; }
-
             .composer {
                 padding: 8px 10px 16px;
                 padding-bottom: calc(18px + var(--safe-bottom));
@@ -613,101 +577,20 @@
                 border-radius: 24px;
                 padding: 5px 5px 5px 14px;
             }
-            .composer textarea {
-                font-size: 16px;
-                min-height: 20px;
-            }
-            .composer button.send {
-                width: 40px;
-                height: 40px;
-            }
-            .quick-row { gap: 5px; margin-bottom: 8px; }
-            .quick-btn {
-                font-size: 9px;
-                padding: 4px 9px;
-                min-height: 28px;
-            }
+            .composer textarea { font-size: 16px; min-height: 20px; }
+            .composer button.send { width: 40px; height: 40px; }
             .empty-state { padding: 24px 14px; }
             .empty-state i { font-size: 28px; }
             .empty-state h3 { font-size: 14px; }
             .empty-state p { font-size: 12px; }
-            .toast {
-                font-size: 12px;
-                padding: 10px 18px;
-                bottom: calc(105px + var(--safe-bottom));
-            }
-            .media-preview {
-                flex-wrap: wrap;
-                gap: 8px;
-            }
+            .toast { font-size: 12px; padding: 10px 18px; bottom: calc(105px + var(--safe-bottom)); }
+            .media-preview { flex-wrap: wrap; gap: 8px; }
+            .back-link { font-size: 9px; padding: 3px 6px; border-radius: 6px; }
+            .chat-header h2 { font-size: 10px !important; }
         }
-
-
-/* ===== BACK TO DASHBOARD BUTTON ===== */
-.back-link {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    color: var(--text-secondary);
-    text-decoration: none;
-    font-size: 12px;
-    font-weight: 500;
-    padding: 6px 12px;
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    transition: all 0.2s ease;
-    margin-right: 8px;
-    white-space: nowrap;
-    flex-shrink: 0;
-}
-.back-link:hover {
-    color: var(--text);
-    border-color: var(--accent);
-    background: rgba(17,133,254,0.08);
-}
-.back-link i {
-    font-size: 12px;
-}
-
-@media (max-width: 768px) {
-    .back-link {
-        font-size: 10px;
-        padding: 4px 8px;
-        margin-right: 4px;
-    }
-    .back-link i {
-        font-size: 10px;
-    }
-    .chat-header {
-        padding-left: 48px;
-        gap: 4px;
-        flex-wrap: nowrap;
-    }
-    .chat-header h2 {
-        font-size: 11px !important;
-    }
-}
-
-@media (max-width: 480px) {
-    .back-link {
-        font-size: 9px;
-        padding: 3px 6px;
-        border-radius: 6px;
-    }
-    .back-link i {
-        font-size: 9px;
-    }
-    .chat-header h2 {
-        font-size: 10px !important;
-    }
-}
-
-
-
     </style>
 </head>
 <body>
-    <!-- Sidebar toggle (mobile) -->
     <button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar">
         <i class="fas fa-bars"></i>
     </button>
@@ -719,6 +602,7 @@
             <h1>AI Vault</h1>
             <span class="badge">Chat</span>
         </div>
+
         <div class="status-card" id="statusCard">
             <div class="handle" id="statusHandle">Not logged in</div>
             <div class="row"><span>Vault</span><strong id="sVault">—</strong></div>
@@ -726,6 +610,7 @@
             <div class="row"><span>Posted</span><strong id="sPosted">—</strong></div>
             <div class="row"><span>Accounts</span><strong id="sAccounts">—</strong></div>
         </div>
+
         <div class="auto-banner" id="autoBanner">
             <div class="auto-title">
                 <span class="live-dot" id="autoDot"></span>
@@ -734,7 +619,16 @@
             </div>
             <div class="auto-meta" id="autoMeta">Not configured yet</div>
             <div id="pipelineList"></div>
+            <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);display:flex;gap:8px;flex-wrap:wrap;">
+                <button onclick="masterFetchAll()" class="btn btn-secondary" style="flex:1;min-width:80px;justify-content:center;font-size:11px;padding:6px 12px;">
+                    <i class="fas fa-database"></i> Fetch All
+                </button>
+                <button onclick="masterFetchStatus()" class="btn btn-secondary" style="flex:1;min-width:80px;justify-content:center;font-size:11px;padding:6px 12px;">
+                    <i class="fas fa-chart-simple"></i> Reserve Status
+                </button>
+            </div>
         </div>
+
         <div class="sidebar-actions">
             <button class="btn btn-secondary" onclick="refreshStatus()">
                 <i class="fas fa-sync-alt"></i> Refresh status
@@ -749,91 +643,74 @@
     </aside>
 
     <main class="main">
-
-
-
-
-
-
-
-
-<div class="chat-header">
-    <a href="https://smartmaster.vercel.app" class="back-link">
-        <i class="fas fa-arrow-left"></i> Dashboard
-    </a>
-    <div>
-        <h2>Bluesky → Facebook AI</h2>
-        <div class="sub">Fetch Bluesky → vault → post to Facebook</div>
-    </div>
-    <div class="header-auto" id="headerAuto">
-        <span class="live-dot" id="headerDot"></span>
-        <span id="headerAutoLabel">Auto off</span>
-    </div>
-</div>
-
-<div class="messages" id="messages">
-    <div class="empty-state" id="emptyState">
-        <i class="fas fa-comments"></i>
-        <h3>Start a conversation</h3>
-        <p>Ask me to login, fetch posts, fill the vault, schedule content, or post to Facebook right now.</p>
-    </div>
-</div>
-
-<div class="typing" id="typing">
-    <div class="dots"><span></span><span></span><span></span></div>
-    Thinking…
-</div>
-
-<div class="composer">
-    <div class="composer-inner">
-        <div class="input-wrapper" style="flex:1;min-width:0;">
-            <textarea id="input" rows="1" placeholder="Message the AI… (Enter to send)"></textarea>
+        <div class="chat-header">
+            <a href="https://smartmaster.vercel.app" class="back-link">
+                <i class="fas fa-arrow-left"></i> Dashboard
+            </a>
+            <div>
+                <h2>Bluesky → Facebook AI</h2>
+                <div class="sub">Fetch Bluesky → vault → post to Facebook</div>
+            </div>
+            <div class="header-auto" id="headerAuto">
+                <span class="live-dot" id="headerDot"></span>
+                <span id="headerAutoLabel">Auto off</span>
+            </div>
         </div>
-        <button class="send" id="sendBtn" onclick="sendMessage()" disabled>
-            <i class="fas fa-paper-plane"></i>
-        </button>
-    </div>
-    <div id="mediaPreview" style="display:none;" class="media-preview">
-        <div style="position:relative;width:48px;height:48px;border-radius:8px;overflow:hidden;flex-shrink:0;border:1px solid var(--border);">
-            <img id="mediaPreviewImage" style="width:100%;height:100%;object-fit:cover;"/>
-            <button onclick="removeMedia()" style="position:absolute;top:-4px;right:-4px;width:18px;height:18px;border-radius:50%;background:var(--error);color:#fff;border:none;cursor:pointer;font-size:9px;">&times;</button>
+
+        <div class="messages" id="messages">
+            <div class="empty-state" id="emptyState">
+                <i class="fas fa-comments"></i>
+                <h3>Start a conversation</h3>
+                <p>Ask me to login, fetch posts, fill the vault, schedule content, or post to Facebook right now.</p>
+            </div>
         </div>
-        <div style="flex:1;min-width:0;">
-            <span id="mediaFileName" style="display:block;font-size:12px;font-weight:500;"></span>
-            <span id="mediaFileSize" style="font-size:10px;color:var(--text-muted);"></span>
+
+        <div class="typing" id="typing">
+            <div class="dots"><span></span><span></span><span></span></div>
+            Thinking…
         </div>
-        <div style="display:flex;gap:4px;flex-wrap:wrap;">
-            <button onclick="postImageNow()" style="background:var(--accent);color:#fff;border:none;padding:4px 12px;border-radius:6px;font-size:10px;cursor:pointer;">Post Now</button>
-            <button onclick="scheduleImage()" style="background:transparent;color:var(--text-secondary);border:1px solid var(--border);padding:4px 12px;border-radius:6px;font-size:10px;cursor:pointer;">Schedule</button>
-            <button onclick="saveToVault()" style="background:transparent;color:var(--warning);border:1px solid var(--border);padding:4px 12px;border-radius:6px;font-size:10px;cursor:pointer;">Save</button>
+
+        <div class="composer">
+            <div class="composer-inner">
+                <div class="input-wrapper">
+                    <textarea id="input" rows="1" placeholder="Message the AI… (Enter to send)"></textarea>
+                </div>
+                <button class="send" id="sendBtn" onclick="sendMessage()" disabled>
+                    <i class="fas fa-paper-plane"></i>
+                </button>
+            </div>
+            <div id="mediaPreview" style="display:none;" class="media-preview">
+                <div style="position:relative;width:48px;height:48px;border-radius:8px;overflow:hidden;flex-shrink:0;border:1px solid var(--border);background:var(--bg);">
+                    <img id="mediaPreviewImage" style="width:100%;height:100%;object-fit:cover;"/>
+                    <button onclick="removeMedia()" style="position:absolute;top:-4px;right:-4px;width:18px;height:18px;border-radius:50%;background:var(--error);color:#fff;border:none;cursor:pointer;font-size:9px;display:flex;align-items:center;justify-content:center;">&times;</button>
+                </div>
+                <div style="flex:1;min-width:0;">
+                    <span id="mediaFileName" style="display:block;font-size:12px;font-weight:500;color:var(--text);"></span>
+                    <span id="mediaFileSize" style="font-size:10px;color:var(--text-muted);"></span>
+                </div>
+                <div style="display:flex;gap:4px;flex-shrink:0;flex-wrap:wrap;">
+                    <button onclick="postImageNow()" style="background:var(--accent);color:#fff;border:none;padding:4px 12px;border-radius:6px;font-size:10px;cursor:pointer;">Post Now</button>
+                    <button onclick="scheduleImage()" style="background:transparent;color:var(--text-secondary);border:1px solid var(--border);padding:4px 12px;border-radius:6px;font-size:10px;cursor:pointer;">Schedule</button>
+                    <button onclick="saveToVault()" style="background:transparent;color:var(--warning);border:1px solid var(--border);padding:4px 12px;border-radius:6px;font-size:10px;cursor:pointer;">Save</button>
+                </div>
+            </div>
         </div>
-    </div>
-</div>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     </main>
 
 <script>
 const API = window.location.origin;
 let history = [];
-let sessionId = localStorage.getItem('aivault_session_id') || null;
-let chatKey = localStorage.getItem('aivault_chat_key') || crypto.randomUUID();
-localStorage.setItem('aivault_chat_key', chatKey);
+let sessionId = localStorage.getItem('aivault_fb_session_id');
+if (!sessionId) {
+    sessionId = crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+    localStorage.setItem('aivault_fb_session_id', sessionId);
+}
+let chatKey = localStorage.getItem('aivault_fb_chat_key');
+if (!chatKey) {
+    chatKey = crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+    localStorage.setItem('aivault_fb_chat_key', chatKey);
+}
+
 const $ = id => document.getElementById(id);
 const messagesEl = $('messages');
 const inputEl = $('input');
@@ -842,7 +719,6 @@ const typingEl = $('typing');
 const emptyState = $('emptyState');
 let uploadedMedia = null;
 
-// ===== SIDEBAR TOGGLE =====
 const sidebar = $('sidebar');
 const overlay = $('sidebarOverlay');
 const toggleBtn = $('sidebarToggle');
@@ -862,7 +738,6 @@ window.addEventListener('resize', () => {
     if (window.innerWidth > 768 && sidebar.classList.contains('open')) toggleSidebar();
 });
 
-// ===== INPUT =====
 inputEl.addEventListener('input', () => {
     inputEl.style.height = 'auto';
     inputEl.style.height = Math.min(inputEl.scrollHeight, 140) + 'px';
@@ -924,6 +799,7 @@ function addMessage(role, content, toolNames = [], images = []) {
     messagesEl.appendChild(div);
     messagesEl.scrollTop = messagesEl.scrollHeight;
 }
+
 async function sendMessage() {
     const text = inputEl.value.trim();
     if (!text) return;
@@ -952,13 +828,13 @@ async function sendMessage() {
         }
         if (data.session_id) {
             sessionId = data.session_id;
-            localStorage.setItem('aivault_session_id', sessionId);
+            localStorage.setItem('aivault_fb_session_id', sessionId);
         }
         if (data.tool_results) {
             for (const tr of data.tool_results) {
                 if (tr.result && tr.result.session_id) {
                     sessionId = tr.result.session_id;
-                    localStorage.setItem('aivault_session_id', sessionId);
+                    localStorage.setItem('aivault_fb_session_id', sessionId);
                 }
             }
         }
@@ -995,17 +871,14 @@ async function sendMessage() {
         addMessage('assistant', 'Network error: ' + e.message);
     }
 }
-function sendQuick(text) {
-    inputEl.value = text;
-    sendBtn.disabled = false;
-    sendMessage();
-}
+
 function clearChat() {
     history = [];
     messagesEl.innerHTML = '';
     emptyState.style.display = 'flex';
     messagesEl.appendChild(emptyState);
 }
+
 async function refreshStatus() {
     try {
         const res = await fetch(`${API}/api/status`);
@@ -1022,6 +895,121 @@ async function refreshStatus() {
     } catch (e) { console.warn('status refresh failed', e); }
     refreshAutoStatus();
 }
+
+async function masterFetchNiche(nicheName) {
+    if (!nicheName) return;
+    try {
+        toast(`🔄 Fetching reserve for "${nicheName}"...`, 'info');
+        const res = await fetch(`${API}/api/niche/master-fetch`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: nicheName, limit_per_source: 20 })
+        });
+        const data = await res.json();
+        if (data.success) {
+            toast(`✅ ${data.message || 'Reserve updated!'}`, 'success');
+            refreshAutoStatus();
+        } else {
+            toast(`❌ ${data.error || 'Fetch failed'}`, 'error');
+        }
+    } catch (e) {
+        toast(`❌ Error: ${e.message}`, 'error');
+    }
+}
+
+async function masterFetchAll() {
+    try {
+        toast(`🔄 Fetching all niches...`, 'info');
+        const res = await fetch(`${API}/api/niche/master-fetch-all`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ limit_per_source: 20 })
+        });
+        const data = await res.json();
+        if (data.success) {
+            toast(`✅ ${data.message || 'All reserves updated!'}`, 'success');
+            refreshAutoStatus();
+        } else {
+            toast(`❌ ${data.error || 'Fetch failed'}`, 'error');
+        }
+    } catch (e) {
+        toast(`❌ Error: ${e.message}`, 'error');
+    }
+}
+
+async function masterFetchStatus() {
+    try {
+        const res = await fetch(`${API}/api/master/status`);
+        const data = await res.json();
+        if (!data.success) {
+            toast(`❌ ${data.error || 'Failed to get status'}`, 'error');
+            return;
+        }
+        const niches = data.niches || [];
+        if (!niches.length) {
+            toast(`📦 No niches configured yet`, 'info');
+            return;
+        }
+        let msg = `📦 Reserve Status (Facebook):\n`;
+        niches.forEach(n => {
+            const status = n.enabled ? '🟢' : '🔴';
+            msg += `${status} ${n.niche}: ${n.count} posts (${n.source_handles?.length || 0} sources)\n`;
+        });
+        msg += `\nTotal: ${data.total_reserve} posts across ${data.total_niches} niches`;
+        addMessage('assistant', msg, ['master_fetch_status']);
+    } catch (e) {
+        toast(`❌ Error: ${e.message}`, 'error');
+    }
+}
+
+async function togglePipeline(name) {
+    if (!name) return;
+    try {
+        const pipelines = window._pipelines || [];
+        const p = pipelines.find(p => p.name === name);
+        if (!p) {
+            toast(`❌ Pipeline "${name}" not found`, 'error');
+            return;
+        }
+        const action = p.enabled ? 'stop' : 'start';
+        const res = await fetch(`${API}/api/auto/${action}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: name })
+        });
+        const data = await res.json();
+        if (data.success) {
+            toast(`✅ ${data.message || `Pipeline ${action}ed`}`, 'success');
+            refreshAutoStatus();
+        } else {
+            toast(`❌ ${data.error || 'Action failed'}`, 'error');
+        }
+    } catch (e) {
+        toast(`❌ Error: ${e.message}`, 'error');
+    }
+}
+
+async function deletePipeline(name) {
+    if (!name) return;
+    if (!confirm(`⚠️ Permanently delete pipeline "${name}"?\nThis cannot be undone!`)) return;
+    try {
+        const res = await fetch(`${API}/api/auto/remove`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name })
+        });
+        const data = await res.json();
+        if (data.success) {
+            toast(`🗑️ ${data.message || 'Pipeline deleted'}`, 'success');
+            refreshAutoStatus();
+        } else {
+            toast(`❌ ${data.error || 'Delete failed'}`, 'error');
+        }
+    } catch (e) {
+        toast(`❌ Error: ${e.message}`, 'error');
+    }
+}
+
 async function refreshAutoStatus() {
     try {
         const res = await fetch(`${API}/api/auto/status`);
@@ -1030,6 +1018,21 @@ async function refreshAutoStatus() {
         const pipelines = data.pipelines || [];
         const enabledList = pipelines.filter(p => p.enabled);
         const on = !!(data.running && enabledList.length);
+        window._pipelines = pipelines;
+
+        let masterStatus = {};
+        try {
+            const masterRes = await fetch(`${API}/api/master/status`);
+            if (masterRes.ok) {
+                const masterData = await masterRes.json();
+                if (masterData.success) {
+                    (masterData.niches || []).forEach(n => {
+                        masterStatus[n.niche] = n.count || 0;
+                    });
+                }
+            }
+        } catch (e) { /* non-critical */ }
+
         const banner = $('autoBanner');
         const dot = $('autoDot');
         const title = $('autoTitle');
@@ -1040,11 +1043,13 @@ async function refreshAutoStatus() {
         const btn = $('autoToggleBtn');
         const pipelineList = $('pipelineList');
         const pipelinesCount = $('autoPipelinesCount');
+
         if (banner) banner.classList.toggle('running', on);
         if (header) header.classList.toggle('on', on);
         if (dot) dot.className = 'live-dot' + (on ? ' on' : (enabledList.length ? ' warn' : ''));
         if (headerDot) headerDot.className = 'live-dot' + (on ? ' on' : (enabledList.length ? ' warn' : ''));
         if (pipelinesCount) pipelinesCount.textContent = String(pipelines.length);
+
         if (title) {
             if (on) title.textContent = `Auto ON · ${enabledList.length} active`;
             else if (enabledList.length) title.textContent = `Enabled · waiting`;
@@ -1062,8 +1067,11 @@ async function refreshAutoStatus() {
             if (first && first.poll_interval_sec) parts.push(`every <strong>${first.poll_interval_sec}s</strong>`);
             const lastResult = pipelines.find(p => p.last_result)?.last_result;
             if (lastResult) parts.push(`last: ${escapeHtml(String(lastResult).slice(0, 48))}`);
+            const lastError = pipelines.find(p => p.last_error)?.last_error;
+            if (lastError) parts.push(`<span style="color:var(--error)">err</span>`);
             meta.innerHTML = parts.join(' · ');
         }
+
         if (pipelineList) {
             if (!pipelines.length) {
                 pipelineList.innerHTML = '<div class="pipe-empty">No pipelines configured</div>';
@@ -1072,36 +1080,55 @@ async function refreshAutoStatus() {
                     const isOn = p.enabled && data.running;
                     const isWait = p.enabled && !data.running;
                     const dotCls = isOn ? 'on' : (isWait ? 'warn' : '');
-                    const src = p.source_handle || '?';
+                    const src = p.source_handle || (Array.isArray(p.source_handles) && p.source_handles[0]) || '?';
                     const dest = p.account_username || '?';
-                    return `<div class="pipe-row" title="${escapeHtml(p.name || '')}: @${escapeHtml(src)} → ${escapeHtml(String(dest))}">
+                    const name = p.name || 'unnamed';
+                    const reserveCount = masterStatus[name] !== undefined ? masterStatus[name] : '—';
+                    return `<div class="pipe-row" title="${escapeHtml(name)}: @${escapeHtml(String(src))} → ${escapeHtml(String(dest))}">
                         <span class="pipe-dot ${dotCls}"></span>
                         <div class="pipe-body">
-                            <div class="pipe-name">${escapeHtml(p.name || 'unnamed')}</div>
-                            <div class="pipe-route">@${escapeHtml(src)} → ${escapeHtml(String(dest))}</div>
+                            <div class="pipe-name">${escapeHtml(name)}</div>
+                            <div class="pipe-route">
+                                @${escapeHtml(String(src))} → ${escapeHtml(String(dest))}
+                                <span style="font-size:9px;color:var(--text-muted);margin-left:8px;">📦 ${reserveCount}</span>
+                            </div>
+                        </div>
+                        <div class="pipe-actions">
+                            <button onclick="masterFetchNiche('${escapeHtml(name)}')" title="Master Fetch" style="background:transparent;border:none;color:var(--accent);cursor:pointer;font-size:11px;padding:2px 4px;">
+                                <i class="fas fa-download"></i>
+                            </button>
+                            ${isOn
+                                ? `<button onclick="togglePipeline('${escapeHtml(name)}')" title="Stop" style="background:transparent;border:none;color:var(--warning);cursor:pointer;font-size:11px;padding:2px 4px;"><i class="fas fa-pause"></i></button>`
+                                : `<button onclick="togglePipeline('${escapeHtml(name)}')" title="Start" style="background:transparent;border:none;color:var(--success);cursor:pointer;font-size:11px;padding:2px 4px;"><i class="fas fa-play"></i></button>`}
+                            <button onclick="deletePipeline('${escapeHtml(name)}')" title="Delete" style="background:transparent;border:none;color:var(--error);cursor:pointer;font-size:11px;padding:2px 4px;"><i class="fas fa-trash"></i></button>
                         </div>
                     </div>`;
                 }).join('');
             }
         }
+
         if (btn) {
             btn.innerHTML = on
                 ? '<i class="fas fa-stop"></i> Stop auto'
                 : '<i class="fas fa-robot"></i> Start auto';
         }
         window._autoRunning = on;
-    } catch (e) { console.warn('auto status refresh failed', e); }
+    } catch (e) {
+        console.warn('auto status refresh failed', e);
+    }
 }
+
 async function toggleAuto() {
     const btn = $('autoToggleBtn');
     if (btn) btn.disabled = true;
     try {
         const endpoint = window._autoRunning ? '/api/auto/stop' : '/api/auto/start';
-        await fetch(`${API}${endpoint}`, { method: 'POST' });
+        await fetch(`${API}${endpoint}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
         await refreshAutoStatus();
     } catch (e) { console.warn('toggle auto failed', e); }
     finally { if (btn) btn.disabled = false; }
 }
+
 function removeMedia() {
     uploadedMedia = null;
     const preview = document.getElementById('mediaPreview');
@@ -1127,6 +1154,7 @@ function saveToVault() {
     sendBtn.disabled = false;
     sendMessage();
 }
+
 refreshStatus();
 setInterval(refreshAutoStatus, 8000);
 setInterval(refreshStatus, 45000);

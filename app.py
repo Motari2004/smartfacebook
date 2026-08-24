@@ -1,26 +1,10 @@
-
-# ============================================================
-# VERCEL COMPATIBILITY
-# ============================================================
-
-import os
-
-# Check if running on Vercel
-IS_VERCEL = os.environ.get('VERCEL') == '1' or os.environ.get('VERCEL_ENV') is not None
-
-if IS_VERCEL:
-    print("🚀 Running on Vercel (serverless mode) - Auto-pilot disabled")
-
-
-
-
 """
-Bluesky AI Vault → Facebook only
-AI chat on top of Bluesky fetch → vault → schedule / post-now (Zernio Facebook)
-Source: Bluesky · Destination: Facebook
+Bluesky AI Vault → Facebook
+AI chat: Bluesky fetch → vault → schedule / post-now (Zernio Facebook only)
+Named auto pipelines, master-fetch reserve, niche sources — same logic as Instagram service.
 """
 
-from flask import Flask, request, jsonify, send_from_directory, Response
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from atproto import Client
 import json
@@ -45,16 +29,25 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ============================================================
+# VERCEL / ENV
+# ============================================================
 
-sessions = {}  # in-memory session cache
+IS_VERCEL = os.environ.get('VERCEL') == '1' or os.environ.get('VERCEL_ENV') is not None
+if IS_VERCEL:
+    print("🚀 Running on Vercel (serverless mode) - background auto-pilot disabled")
 
+BLUESKY_MASTER_HANDLE = os.environ.get('BLUESKY_MASTER_HANDLE')
+BLUESKY_MASTER_PASSWORD = os.environ.get('BLUESKY_MASTER_PASSWORD')
+if BLUESKY_MASTER_HANDLE and BLUESKY_MASTER_PASSWORD:
+    print(f"✅ Master Bluesky account loaded: @{BLUESKY_MASTER_HANDLE}")
+else:
+    print("⚠️ No master Bluesky account in .env — master-fetch will need a session")
+
+sessions = {}  # in-memory Bluesky session cache
 
 app = Flask(__name__, static_folder='static')
 CORS(app)
-
-# ============================================================
-# CONFIG
-# ============================================================
 
 DATABASE_URL = os.environ.get(
     'DATABASE_URL',
@@ -67,16 +60,10 @@ SCHEDULE_TIMEZONE = "Africa/Nairobi"
 TIMEZONE = "Africa/Nairobi"
 LOCAL_TIMEZONE = pytz.timezone(TIMEZONE)
 
-
-
-
-
-
 # ============================================================
-# GEMINI CONFIG - Models with fallback
+# GEMINI
 # ============================================================
 
-# Google Gemini API — Load from environment variables only
 _env_keys = os.environ.get('GEMINI_API_KEYS', '') or os.environ.get('GEMINI_API_KEY', '')
 if _env_keys:
     GEMINI_API_KEYS = [k.strip() for k in _env_keys.split(',') if k.strip()]
@@ -85,163 +72,113 @@ else:
     GEMINI_API_KEYS = []
     print("⚠️  No GEMINI_API_KEYS environment variable set!")
 
-# Models in order of preference (highest quality first)
 GEMINI_MODELS = [
-    "gemini-3.5-flash-lite",   
-    "gemini-2.5-flash-lite",   
-    "gemini-3.6-flash",    
-    "gemini-3.7-flash",        
-    
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
 ]
-
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
-
-# ============================================================
-# GEMINI STATE VARIABLES
-# ============================================================
 
 _gemini_model_index = 0
 _gemini_key_index = 0
 _gemini_key_cooldown = {}
 _gemini_model_cooldown = {}
 
-# ============================================================
-# GEMINI HELPER FUNCTIONS
-# ============================================================
 
 def next_gemini_key():
-    """Get next available Gemini API key (skip cooldown keys)"""
     global _gemini_key_index
     if not GEMINI_API_KEYS:
         return None
-    
-    # Try to find a working key
     for _ in range(len(GEMINI_API_KEYS) * 2):
         key_index = _gemini_key_index % len(GEMINI_API_KEYS)
         key = GEMINI_API_KEYS[key_index]
-        
-        # Check if key is on cooldown
         if key in _gemini_key_cooldown:
-            cooldown_until = _gemini_key_cooldown[key]
-            if datetime.now() < cooldown_until:
+            if datetime.now() < _gemini_key_cooldown[key]:
                 _gemini_key_index += 1
                 continue
-        
         _gemini_key_index += 1
         return key
-    
-    # All keys on cooldown
-    print("⚠️ All API keys on cooldown")
     return GEMINI_API_KEYS[0] if GEMINI_API_KEYS else None
 
+
 def next_gemini_model():
-    """Get next model in round-robin fashion"""
     global _gemini_model_index
     if not GEMINI_MODELS:
-        return "gemini-2.5-flash-lite"
-    
+        return "gemini-2.0-flash-lite"
     model = GEMINI_MODELS[_gemini_model_index % len(GEMINI_MODELS)]
     _gemini_model_index += 1
     return model
 
+
 def handle_model_rate_limit(model):
-    """Put a model on cooldown if it's rate-limited"""
     _gemini_model_cooldown[model] = datetime.now() + timedelta(seconds=60)
     print(f"⏳ Model {model} on cooldown for 60 seconds")
 
-def call_gemini(messages, tools=None, model=None):
-    """Call Gemini API with automatic model fallback on errors"""
-    
-    # If no model specified, get next model
+
+def call_gemini(messages, tools=None, model=None, max_tokens=1200, timeout=45):
     if model is None:
         model = next_gemini_model()
-    
-    # Check if model is on cooldown
     if model in _gemini_model_cooldown:
-        cooldown_until = _gemini_model_cooldown[model]
-        if datetime.now() < cooldown_until:
-            print(f"⏳ Model {model} on cooldown, trying next model...")
+        if datetime.now() < _gemini_model_cooldown[model]:
             next_model = next_gemini_model()
             if next_model != model:
-                return call_gemini(messages, tools, next_model)
-            return None, f"All models on cooldown"
-    
-    # Get API key
+                return call_gemini(messages, tools, next_model, max_tokens, timeout)
+            return None, "All models on cooldown"
+
     key = next_gemini_key()
     if not key:
         return None, "No Gemini API keys"
-    
-    print(f"🔑 Using Gemini key: {key[:12]}... with model: {model}")
-    
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json"
-    }
+
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     payload = {
         "model": model,
         "messages": messages,
+        "temperature": 0.2,
+        "max_tokens": max_tokens,
     }
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
-    
+
     try:
         r = requests.post(
             f"{GEMINI_BASE_URL}/chat/completions",
             headers=headers,
             json=payload,
-            timeout=60
+            timeout=timeout,
         )
-        print(f"📥 Gemini response status: {r.status_code} (model: {model})")
-        
-        # Handle rate limit - try next model
+        print(f"📥 Gemini status: {r.status_code} model={model}")
+
+        if r.status_code == 403:
+            _gemini_key_cooldown[key] = datetime.now() + timedelta(seconds=300)
+            next_key = next_gemini_key()
+            if next_key and next_key != key:
+                return call_gemini(messages, tools, model, max_tokens, timeout)
+            return None, "All API keys invalid or on cooldown"
+
         if r.status_code == 429:
-            print(f"⚠️ Rate limit hit for model {model}")
             handle_model_rate_limit(model)
-            
-            # Try next model
             next_model = next_gemini_model()
             if next_model != model:
-                print(f"🔄 Switching to next model: {next_model}")
-                return call_gemini(messages, tools, next_model)
-            return None, f"Rate limit exceeded - all models exhausted"
-        
-        # Handle other errors - try next model
+                return call_gemini(messages, tools, next_model, max_tokens, timeout)
+            return None, "Rate limit exceeded"
+
         if r.status_code != 200:
-            print(f"❌ Gemini error with model {model}: {r.text[:200]}")
-            
-            # Try next model for non-200 errors (except 400 which is usually bad request)
-            if r.status_code != 400:
+            if r.status_code not in (400, 403):
                 next_model = next_gemini_model()
                 if next_model != model:
-                    print(f"🔄 Switching to next model: {next_model}")
-                    return call_gemini(messages, tools, next_model)
-            
-            return None, f"Gemini {r.status_code} with {model}: {r.text[:300]}"
-        
-        # Success! Reset model cooldown
+                    return call_gemini(messages, tools, next_model, max_tokens, timeout)
+            return None, f"Gemini {r.status_code}: {r.text[:300]}"
+
         if model in _gemini_model_cooldown:
             del _gemini_model_cooldown[model]
-        
         return r.json(), None
-        
     except Exception as e:
-        print(f"❌ Gemini exception with {model}: {e}")
-        # Try next model on exception
         next_model = next_gemini_model()
         if next_model != model:
-            print(f"🔄 Switching to next model on exception: {next_model}")
-            return call_gemini(messages, tools, next_model)
+            return call_gemini(messages, tools, next_model, max_tokens, timeout)
         return None, str(e)
-    
-    
-    
-    
-    
-    
-    
-    
-    
 
 
 def get_now():
@@ -249,7 +186,6 @@ def get_now():
 
 
 def format_datetime_for_zernio(dt):
-    """Convert Africa/Nairobi datetime to UTC ISO for Zernio."""
     if dt is None:
         return None
     if dt.tzinfo is None:
@@ -279,27 +215,21 @@ def parse_datetime_from_input(dt_str):
 
 
 # ============================================================
-# MULTI-ZERNIO-API CONFIG (Facebook accounts)
+# ZERNIO (Facebook accounts only)
 # ============================================================
 
 def _detect_accounts_for_key(api_key, label="key"):
-    """Query Zernio for accounts; keep only Facebook."""
     accounts = []
     if not api_key:
         return accounts
     try:
         headers = {
             "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
-        response = requests.get(
-            f"{ZERNIO_BASE_URL}/accounts",
-            headers=headers,
-            timeout=15
-        )
+        response = requests.get(f"{ZERNIO_BASE_URL}/accounts", headers=headers, timeout=15)
         if response.status_code == 200:
-            zernio_accounts = response.json().get('accounts', [])
-            for acc in zernio_accounts:
+            for acc in response.json().get('accounts', []):
                 if (acc.get('platform') or '').lower() != 'facebook':
                     continue
                 username = acc.get('username')
@@ -323,7 +253,6 @@ def get_zernio_api_keys():
     load_dotenv(override=False)
     keys = []
     seen = set()
-
     i = 1
     while True:
         key = (os.environ.get(f'ZERNIO_API_KEY{i}') or '').strip()
@@ -337,7 +266,7 @@ def get_zernio_api_keys():
                 'index': i,
                 'accounts': accounts,
                 'env_var': env_var,
-                'account_count': len(accounts)
+                'account_count': len(accounts),
             })
             seen.add(key)
         i += 1
@@ -355,7 +284,7 @@ def get_zernio_api_keys():
                 'index': idx,
                 'accounts': accounts,
                 'env_var': 'ZERNIO_API_KEYS',
-                'account_count': len(accounts)
+                'account_count': len(accounts),
             })
             seen.add(key)
 
@@ -368,38 +297,33 @@ def get_zernio_api_keys():
                 'index': 1,
                 'accounts': accounts,
                 'env_var': 'ZERNIO_API_KEY',
-                'account_count': len(accounts)
+                'account_count': len(accounts),
             })
-
     return keys
 
 
 def ensure_zernio_keys_loaded(for_auto: bool = False) -> dict:
     load_dotenv(override=False)
     keys = get_zernio_api_keys()
-
     global ZERNIO_API_KEY
     if keys:
         ZERNIO_API_KEY = keys[0]['key']
-
     previews = []
     for k in keys:
         prev = (k['key'][:12] + '…') if len(k.get('key') or '') > 12 else (k.get('key') or '?')
         acc_names = [a.get('username') for a in (k.get('accounts') or []) if a.get('username')]
         acc = ', '.join(acc_names) if acc_names else 'auto-detect'
         previews.append(f"{k.get('env_var', k.get('index'))}: {prev} ({acc})")
-
     if keys:
         msg = f"Loaded {len(keys)} Zernio API key(s) from .env"
         print(f"🔑 {msg}")
         for line in previews:
             print(f"   • {line}")
     else:
-        msg = "No Zernio API keys found in .env. Set ZERNIO_API_KEY / ZERNIO_API_KEY1 / ZERNIO_API_KEYS."
+        msg = "No Zernio API keys found in .env."
         if for_auto:
             msg = "⚠️ Auto pilot cannot post: " + msg
         print(f"⚠️ {msg}")
-
     return {
         "success": len(keys) > 0,
         "count": len(keys),
@@ -412,14 +336,10 @@ def ensure_zernio_keys_loaded(for_auto: bool = False) -> dict:
 def get_zernio_headers_for_key(api_key):
     if not api_key:
         return {}
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
+    return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
 
 def get_zernio_headers():
-    """Default headers using first available key."""
     keys = get_zernio_api_keys()
     if keys:
         return get_zernio_headers_for_key(keys[0]['key'])
@@ -450,16 +370,13 @@ def get_zernio_headers_for_account(account_username=None):
                     conn.close()
                 except Exception:
                     pass
-
     return get_zernio_headers()
 
 
 def save_zernio_account_row(account_id, platform, display_name, username,
                             profile_picture, api_key, api_key_index=None):
     platform = (platform or 'facebook').lower()
-    if platform != 'facebook':
-        return False
-    if not account_id:
+    if platform != 'facebook' or not account_id:
         return False
     conn = get_db_connection()
     if not conn:
@@ -482,22 +399,18 @@ def save_zernio_account_row(account_id, platform, display_name, username,
                     last_sync = CURRENT_TIMESTAMP
             """, (
                 account_id, platform, display_name, username,
-                profile_picture, api_key, api_key_index
+                profile_picture, api_key, api_key_index,
             ))
         except Exception:
             cur.execute("""
                 UPDATE zernio_accounts SET
-                    display_name = %s,
-                    username = %s,
-                    profile_picture = %s,
-                    api_key = %s,
-                    api_key_index = COALESCE(%s, api_key_index),
-                    is_active = TRUE,
-                    last_sync = CURRENT_TIMESTAMP
+                    display_name = %s, username = %s, profile_picture = %s,
+                    api_key = %s, api_key_index = COALESCE(%s, api_key_index),
+                    is_active = TRUE, last_sync = CURRENT_TIMESTAMP
                 WHERE account_id = %s AND platform = %s
             """, (
                 display_name, username, profile_picture,
-                api_key, api_key_index, account_id, platform
+                api_key, api_key_index, account_id, platform,
             ))
             if cur.rowcount == 0:
                 cur.execute("""
@@ -507,7 +420,7 @@ def save_zernio_account_row(account_id, platform, display_name, username,
                     VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE, CURRENT_TIMESTAMP)
                 """, (
                     account_id, platform, display_name, username,
-                    profile_picture, api_key, api_key_index
+                    profile_picture, api_key, api_key_index,
                 ))
         conn.commit()
         cur.close()
@@ -527,7 +440,6 @@ def refresh_all_zernio_accounts():
     status = ensure_zernio_keys_loaded()
     keys = status.get('keys') or []
     all_accounts = []
-
     for key_info in keys:
         api_key = key_info.get('key')
         index = key_info.get('index')
@@ -547,19 +459,13 @@ def refresh_all_zernio_accounts():
                 )
                 all_accounts.append(acc)
             continue
-
         headers = get_zernio_headers_for_key(api_key)
         if not headers:
             continue
         try:
-            response = requests.get(
-                f"{ZERNIO_BASE_URL}/accounts",
-                headers=headers,
-                timeout=15
-            )
+            response = requests.get(f"{ZERNIO_BASE_URL}/accounts", headers=headers, timeout=15)
             if response.status_code == 200:
-                accounts = response.json().get('accounts', [])
-                for acc in accounts:
+                for acc in response.json().get('accounts', []):
                     if (acc.get('platform') or '').lower() != 'facebook':
                         continue
                     save_zernio_account_row(
@@ -574,7 +480,6 @@ def refresh_all_zernio_accounts():
                     all_accounts.append(acc)
         except Exception as e:
             print(f"Error fetching accounts for key {index}: {e}")
-
     return all_accounts
 
 
@@ -583,57 +488,35 @@ def tool_check_zernio_key(api_key: str = None, save_to_db: bool = True) -> dict:
         return {
             "success": False,
             "error": "No API key provided",
-            "message": "Paste a Zernio key like: check key sk_xxxxx"
+            "message": "Paste a Zernio key like: check key sk_xxxxx",
         }
-
     raw = str(api_key).strip()
     if '=' in raw:
         raw = raw.split('=', 1)[1].strip()
     raw = raw.strip().strip('"').strip("'")
-
     if not raw.startswith('sk_') and len(raw) < 20:
         return {
             "success": False,
             "error": "That does not look like a Zernio API key",
-            "message": "Zernio keys usually start with sk_ — paste the full key."
+            "message": "Zernio keys usually start with sk_ — paste the full key.",
         }
-
     headers = get_zernio_headers_for_key(raw)
     try:
-        response = requests.get(
-            f"{ZERNIO_BASE_URL}/accounts",
-            headers=headers,
-            timeout=15
-        )
+        response = requests.get(f"{ZERNIO_BASE_URL}/accounts", headers=headers, timeout=15)
     except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "message": f"❌ Could not reach Zernio: {e}"
-        }
-
+        return {"success": False, "error": str(e), "message": f"❌ Could not reach Zernio: {e}"}
     if response.status_code == 401:
-        return {
-            "success": False,
-            "error": "Invalid API key",
-            "message": "❌ This Zernio API key is invalid or revoked (401)."
-        }
+        return {"success": False, "error": "Invalid API key", "message": "❌ Invalid or revoked key (401)."}
     if response.status_code == 429:
-        return {
-            "success": False,
-            "error": "Rate limited",
-            "message": "⚠️ Zernio rate-limited this key. Try again in a minute."
-        }
+        return {"success": False, "error": "Rate limited", "message": "⚠️ Rate-limited. Try again later."}
     if response.status_code != 200:
         return {
             "success": False,
             "error": f"HTTP {response.status_code}",
-            "message": f"❌ Zernio error {response.status_code}: {response.text[:200]}"
+            "message": f"❌ Zernio error {response.status_code}: {response.text[:200]}",
         }
-
-    zernio_accounts = response.json().get('accounts', []) or []
     accounts = []
-    for acc in zernio_accounts:
+    for acc in response.json().get('accounts', []) or []:
         if (acc.get('platform') or '').lower() != 'facebook':
             continue
         username = acc.get('username')
@@ -647,7 +530,6 @@ def tool_check_zernio_key(api_key: str = None, save_to_db: bool = True) -> dict:
             "profile_picture": acc.get('profilePicture'),
         }
         accounts.append(entry)
-
         if save_to_db:
             save_zernio_account_row(
                 account_id=entry['account_id'],
@@ -658,23 +540,18 @@ def tool_check_zernio_key(api_key: str = None, save_to_db: bool = True) -> dict:
                 api_key=raw,
                 api_key_index=None,
             )
-
     key_preview = raw[:12] + '…' if len(raw) > 12 else raw
     if not accounts:
         msg = (
             f"✅ Key valid ({key_preview})\n"
-            f"But no Facebook accounts are connected on this Zernio key yet.\n"
-            f"Connect a Facebook account in the Zernio dashboard first."
+            f"But no Facebook accounts on this key yet.\n"
+            f"Connect Facebook in the Zernio dashboard first."
         )
     else:
         lines = [f"✅ Key valid ({key_preview}) — {len(accounts)} Facebook account(s):"]
         for a in accounts:
-            lines.append(
-                f"  • @{a['username']} ({a['display_name']}) — "
-                f"facebook — id={a['account_id']}"
-            )
+            lines.append(f"  • @{a['username']} ({a['display_name']}) — id={a['account_id']}")
         msg = "\n".join(lines)
-
     return {
         "success": True,
         "valid": True,
@@ -682,6 +559,19 @@ def tool_check_zernio_key(api_key: str = None, save_to_db: bool = True) -> dict:
         "count": len(accounts),
         "accounts": accounts,
         "message": msg,
+    }
+
+
+def tool_list_api_keys():
+    status = ensure_zernio_keys_loaded()
+    keys = status.get('keys') or []
+    total_accounts = sum(k.get('account_count', 0) for k in keys)
+    return {
+        "success": True,
+        "count": len(keys),
+        "total_accounts": total_accounts,
+        "keys": keys,
+        "message": status.get('message'),
     }
 
 
@@ -703,7 +593,6 @@ def init_db():
         return
     try:
         cur = conn.cursor()
-
         cur.execute('''
             CREATE TABLE IF NOT EXISTS sessions (
                 id SERIAL PRIMARY KEY,
@@ -868,6 +757,12 @@ def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        try:
+            cur.execute("ALTER TABLE auto_config ADD COLUMN IF NOT EXISTS niche TEXT")
+            cur.execute("ALTER TABLE auto_config ADD COLUMN IF NOT EXISTS source_handles JSONB")
+            print("✅ Added niche and source_handles columns to auto_config")
+        except Exception as e:
+            print(f"⚠️ Migration note: {e}")
 
         cur.execute('''
             CREATE TABLE IF NOT EXISTS auto_seen (
@@ -904,10 +799,19 @@ def init_db():
             )
         ''')
 
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS app_settings (
+                id SERIAL PRIMARY KEY,
+                key TEXT UNIQUE NOT NULL,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
         conn.commit()
         cur.close()
         conn.close()
-        print("✅ Database initialized (Facebook-only)")
+        print("✅ Database initialized (Facebook-only, multi-pipeline)")
     except Exception as e:
         print(f"❌ DB init error: {e}")
         traceback.print_exc()
@@ -917,273 +821,191 @@ init_db()
 
 
 # ============================================================
-# FACEBOOK POSTING (via Zernio)
+# CRON STATE
 # ============================================================
 
-def upload_media_to_zernio(image_bytes, filename="upload.jpg"):
-    """Upload JPEG/PNG bytes to Zernio; returns public_url or None."""
+def get_cron_state():
     try:
-        image_bytes.seek(0)
-        if filename.lower().endswith('.png'):
-            content_type = 'image/png'
-        elif filename.lower().endswith('.gif'):
-            content_type = 'image/gif'
-        elif filename.lower().endswith('.webp'):
-            content_type = 'image/webp'
-        else:
-            content_type = 'image/jpeg'
+        conn = get_db_connection()
+        if not conn:
+            return True
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM app_settings WHERE key = 'cron_enabled'")
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if row:
+            return row[0].lower() == 'true'
+        return True
+    except Exception:
+        return True
 
-        presign_payload = {
-            "filename": filename,
-            "contentType": content_type
-        }
 
-        response = requests.post(
-            f"{ZERNIO_BASE_URL}/media/presign",
-            headers=get_zernio_headers(),
-            json=presign_payload,
-            timeout=30
-        )
-
-        if response.status_code not in [200, 201]:
-            print(f"Presign error: {response.text}")
-            return None
-
-        data = response.json()
-        upload_url = data.get('uploadUrl')
-        public_url = data.get('publicUrl')
-
-        if not upload_url or not public_url:
-            return None
-
-        image_bytes.seek(0)
-        upload_response = requests.put(
-            upload_url,
-            headers={'Content-Type': content_type},
-            data=image_bytes,
-            timeout=60
-        )
-
-        if upload_response.status_code not in [200, 201, 204]:
-            print(f"Upload error: {upload_response.text}")
-            return None
-
-        return public_url
-
+def set_cron_state(enabled: bool):
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO app_settings (key, value, updated_at)
+            VALUES ('cron_enabled', %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (key) DO UPDATE SET
+                value = EXCLUDED.value,
+                updated_at = CURRENT_TIMESTAMP
+        """, ('true' if enabled else 'false',))
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f"✅ Cron state set to: {'ENABLED' if enabled else 'DISABLED'}")
     except Exception as e:
-        print(f"Error uploading media: {e}")
-        traceback.print_exc()
+        print(f"Error saving cron state: {e}")
+
+
+# ============================================================
+# AUTO CONFIG HELPERS
+# ============================================================
+
+def _load_auto_config(name='default'):
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return None
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM auto_config WHERE name = %s", (name,))
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            conn.close()
+            return None
+        cols = [d[0] for d in cur.description]
+        cfg = dict(zip(cols, row))
+        if cfg.get('source_handles'):
+            if isinstance(cfg['source_handles'], str):
+                try:
+                    cfg['source_handles'] = json.loads(cfg['source_handles'])
+                except Exception:
+                    cfg['source_handles'] = [cfg['source_handles']]
+        elif cfg.get('source_handle'):
+            cfg['source_handles'] = [cfg['source_handle']]
+        else:
+            cfg['source_handles'] = []
+        cur.close()
+        conn.close()
+        return cfg
+    except Exception as e:
+        print(f"load auto_config: {e}")
         return None
 
 
-def create_facebook_post(text, account_id, media_urls=None, scheduled_for=None, topic_tag=None, is_draft=False, content_type='feed'):
-    """
-    Create a Facebook post via Zernio API (pattern from quote-generator Facebook flow).
-    text: can be empty string for image-only posts.
-    scheduled_for: UTC ISO string (or None for publish now).
-    content_type: 'feed' (default) or other Zernio Facebook content types if supported.
-    """
+def _list_auto_configs():
     try:
-        platform_config = {
-            "platform": "facebook",
-            "accountId": account_id
-        }
-
-        if content_type and content_type != 'feed':
-            platform_config["platformSpecificData"] = {
-                "contentType": content_type
-            }
-        if topic_tag:
-            if "platformSpecificData" not in platform_config:
-                platform_config["platformSpecificData"] = {}
-            platform_config["platformSpecificData"]["topic_tag"] = topic_tag
-
-        payload = {
-            "platforms": [platform_config]
-        }
-
-        if text and str(text).strip():
-            payload["content"] = str(text).strip()[:2000]  # Facebook practical caption limit
-
-        if media_urls and len(media_urls) > 0:
-            payload["mediaItems"] = []
-            for url in media_urls:
-                if url and str(url).startswith(('http://', 'https://')):
-                    payload["mediaItems"].append({
-                        "type": "image",
-                        "url": url
-                    })
-
-        if is_draft:
-            payload["isDraft"] = True
-        elif scheduled_for:
-            payload["scheduledFor"] = scheduled_for
-            payload["timezone"] = TIMEZONE
-        else:
-            payload["publishNow"] = True
-
-        print(f"📤 Sending to Facebook: {json.dumps({k: v for k, v in payload.items() if k != 'mediaItems'}, indent=2)}")
-
-        response = requests.post(
-            f"{ZERNIO_BASE_URL}/posts",
-            headers=get_zernio_headers(),
-            json=payload,
-            timeout=30
-        )
-
-        print(f"Facebook post response: {response.status_code}")
-
-        if response.status_code == 201:
-            data = response.json()
-            post = data.get('post') or {}
-            platforms = post.get('platforms') or [{}]
-            return {
-                "success": True,
-                "post_id": post.get('_id'),
-                "status": post.get('status'),
-                "url": platforms[0].get('platformPostUrl') if platforms else None,
-                "scheduled_for": post.get('scheduledFor')
-            }
-        elif response.status_code == 409:
-            error_data = response.json() if response.text else {}
-            return {
-                "success": False,
-                "error": "Duplicate content",
-                "message": error_data.get('message', 'This content was already posted recently')
-            }
-        else:
-            try:
-                error_data = response.json()
-                error_msg = error_data.get('message', response.text)
-            except Exception:
-                error_msg = response.text
-            return {
-                "success": False,
-                "error": f"API Error {response.status_code}",
-                "message": error_msg
-            }
-
-    except Exception as e:
-        print(f"Error creating Facebook post: {e}")
-        traceback.print_exc()
-        return {"success": False, "error": str(e)}
-
-
-def get_facebook_account_id(account_id=None, account_username=None):
-    """Resolve Facebook account_id from args or DB."""
-    if account_id:
-        return account_id
-
-    if account_username:
         conn = get_db_connection()
-        if conn:
-            try:
-                cur = conn.cursor()
-                cur.execute("""
-                    SELECT account_id FROM zernio_accounts
-                    WHERE username = %s AND platform = 'facebook' AND is_active = TRUE
-                    LIMIT 1
-                """, (account_username,))
-                row = cur.fetchone()
-                cur.close()
-                conn.close()
-                if row:
-                    return row[0]
-            except Exception as e:
-                print(f"resolve username: {e}")
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-
-    # First active Facebook account
-    conn = get_db_connection()
-    if conn:
-        try:
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT account_id FROM zernio_accounts
-                WHERE platform = 'facebook' AND is_active = TRUE
-                ORDER BY last_sync DESC NULLS LAST, created_at DESC
-                LIMIT 1
-            """)
-            row = cur.fetchone()
-            cur.close()
-            conn.close()
-            if row:
-                return row[0]
-        except Exception as e:
-            print(f"get first facebook: {e}")
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    # Fallback: live Zernio list
-    accounts = refresh_all_zernio_accounts()
-    for acc in accounts:
-        aid = acc.get('account_id') or acc.get('_id')
-        if aid:
-            return aid
-    return None
-
-
-def resolve_facebook_account_id(account_id=None, account_username=None):
-    return get_facebook_account_id(account_id, account_username)
-
-
-def post_to_facebook(image_url=None, image_bytes=None, caption="", account_id=None,
-                    account_username=None, scheduled_time=None, topic_tag=None, is_draft=False):
-    """
-    Post to Facebook via Zernio.
-    Provide either image_url (already on Zernio/CDN) or image_bytes to upload.
-    scheduled_time: aware datetime in Africa/Nairobi, or None for now.
-    """
-    try:
-        facebook_account_id = get_facebook_account_id(account_id, account_username)
-        if not facebook_account_id:
-            return {
-                "success": False,
-                "error": "No Facebook account connected. Connect one in Zernio and sync keys."
-            }
-
-        public_url = image_url
-        if not public_url and image_bytes:
-            public_url = upload_media_to_zernio(image_bytes)
-            if not public_url:
-                return {
-                    "success": False,
-                    "error": "Failed to upload image to Zernio."
-                }
-
-        media_urls = [public_url] if public_url else None
-
-        scheduled_for = None
-        if scheduled_time:
-            scheduled_for = format_datetime_for_zernio(scheduled_time)
-            print(f"📅 Scheduling GMT+3: {scheduled_time} → UTC: {scheduled_for}")
-
-        result = create_facebook_post(
-            text=caption or "",
-            account_id=facebook_account_id,
-            media_urls=media_urls,
-            scheduled_for=scheduled_for,
-            topic_tag=topic_tag,
-            is_draft=is_draft
-        )
-
-        if result.get('success'):
-            status_text = "Draft saved" if is_draft else ("Scheduled" if scheduled_time else "Posted")
-            result['message'] = f"✅ {status_text} to Facebook!"
-            result['platform'] = 'facebook'
-            result['account_id'] = facebook_account_id
-            result['caption'] = caption or ""
-        return result
-
+        if not conn:
+            return []
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM auto_config ORDER BY name")
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        cur.close()
+        conn.close()
+        configs = []
+        for r in rows:
+            cfg = dict(zip(cols, r))
+            if cfg.get('source_handles'):
+                if isinstance(cfg['source_handles'], str):
+                    try:
+                        cfg['source_handles'] = json.loads(cfg['source_handles'])
+                    except Exception:
+                        cfg['source_handles'] = [cfg['source_handles']]
+            elif cfg.get('source_handle'):
+                cfg['source_handles'] = [cfg['source_handle']]
+            else:
+                cfg['source_handles'] = []
+            configs.append(cfg)
+        return configs
     except Exception as e:
-        print(f"Error posting to Facebook: {e}")
+        print(f"list auto_configs: {e}")
+        return []
+
+
+def _save_auto_config(cfg: dict):
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return False
+        cur = conn.cursor()
+        source_handles_json = None
+        if cfg.get('source_handles'):
+            source_handles_json = Json(cfg['source_handles'])
+        cur.execute('''
+            INSERT INTO auto_config (
+                name, enabled, source_handle, source_handles, niche,
+                account_id, account_username, content_type, poll_interval_sec,
+                media_only, include_reposts, max_posts_per_run, bluesky_handle,
+                bluesky_app_password, last_run_at, last_error, last_result, updated_at
+            ) VALUES (
+                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,CURRENT_TIMESTAMP
+            )
+            ON CONFLICT (name) DO UPDATE SET
+                enabled = EXCLUDED.enabled,
+                source_handle = COALESCE(EXCLUDED.source_handle, auto_config.source_handle),
+                source_handles = COALESCE(EXCLUDED.source_handles, auto_config.source_handles),
+                niche = COALESCE(EXCLUDED.niche, auto_config.niche),
+                account_id = COALESCE(EXCLUDED.account_id, auto_config.account_id),
+                account_username = COALESCE(EXCLUDED.account_username, auto_config.account_username),
+                content_type = COALESCE(EXCLUDED.content_type, auto_config.content_type),
+                poll_interval_sec = COALESCE(EXCLUDED.poll_interval_sec, auto_config.poll_interval_sec),
+                media_only = COALESCE(EXCLUDED.media_only, auto_config.media_only),
+                include_reposts = COALESCE(EXCLUDED.include_reposts, auto_config.include_reposts),
+                max_posts_per_run = COALESCE(EXCLUDED.max_posts_per_run, auto_config.max_posts_per_run),
+                bluesky_handle = COALESCE(EXCLUDED.bluesky_handle, auto_config.bluesky_handle),
+                bluesky_app_password = COALESCE(EXCLUDED.bluesky_app_password, auto_config.bluesky_app_password),
+                last_run_at = COALESCE(EXCLUDED.last_run_at, auto_config.last_run_at),
+                last_error = EXCLUDED.last_error,
+                last_result = EXCLUDED.last_result,
+                updated_at = CURRENT_TIMESTAMP
+        ''', (
+            cfg.get('name') or 'default',
+            bool(cfg.get('enabled', False)),
+            cfg.get('source_handle'),
+            source_handles_json,
+            cfg.get('niche'),
+            cfg.get('account_id'),
+            cfg.get('account_username'),
+            cfg.get('content_type') or 'feed',
+            int(cfg.get('poll_interval_sec') or 300),
+            bool(cfg.get('media_only', True)),
+            bool(cfg.get('include_reposts', False)),
+            int(cfg.get('max_posts_per_run') or 2),
+            cfg.get('bluesky_handle'),
+            cfg.get('bluesky_app_password'),
+            cfg.get('last_run_at'),
+            cfg.get('last_error'),
+            cfg.get('last_result'),
+        ))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"save auto_config: {e}")
         traceback.print_exc()
-        return {"success": False, "error": str(e)}
+        return False
+
+
+def _resolve_pipeline_name(name):
+    if not name:
+        return None
+    configs = _list_auto_configs()
+    for c in configs:
+        if c.get('name') == name:
+            return name
+    lower = name.lower()
+    for c in configs:
+        if (c.get('name') or '').lower() == lower:
+            return c.get('name')
+    return None
 
 
 # ============================================================
@@ -1215,18 +1037,16 @@ def data_url_to_jpeg_bytes(image_data: str):
 
 
 def fix_image_for_feed(image_bytes):
-    """Ensure reasonable JPEG for Facebook feed."""
     try:
         image_bytes.seek(0)
         img = Image.open(image_bytes)
         if img.mode != 'RGB':
             img = img.convert('RGB')
-        # Facebook is flexible; keep under ~4k on long side
         max_side = 2048
         w, h = img.size
         if max(w, h) > max_side:
-            scale = max_side / max(w, h)
-            img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+            ratio = max_side / max(w, h)
+            img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
         out = BytesIO()
         img.save(out, format='JPEG', quality=90, optimize=True)
         out.seek(0)
@@ -1236,177 +1056,448 @@ def fix_image_for_feed(image_bytes):
         return image_bytes
 
 
-# ============================================================
-# BLUESKY TOOLS
-# ============================================================
-
-def tool_login(username, password):
+def upload_media_to_zernio(image_bytes, filename="upload.jpg"):
     try:
-        client = Client()
-        client.login(username, password)
-        profile = client.me
-        handle = profile.handle
-        session_id = str(uuid.uuid4())
-        session_string = client.export_session_string()
-        expires = datetime.utcnow() + timedelta(days=30)
+        image_bytes.seek(0)
+        if filename.lower().endswith('.png'):
+            content_type = 'image/png'
+        else:
+            content_type = 'image/jpeg'
+        response = requests.post(
+            f"{ZERNIO_BASE_URL}/media/presign",
+            headers=get_zernio_headers(),
+            json={"filename": filename, "contentType": content_type},
+            timeout=30,
+        )
+        if response.status_code not in (200, 201):
+            print(f"Presign error: {response.text}")
+            return None
+        data = response.json()
+        upload_url = data.get('uploadUrl')
+        public_url = data.get('publicUrl')
+        if not upload_url or not public_url:
+            return None
+        image_bytes.seek(0)
+        upload_response = requests.put(
+            upload_url,
+            headers={'Content-Type': content_type},
+            data=image_bytes,
+            timeout=60,
+            verify=False,
+        )
+        if upload_response.status_code not in (200, 201, 204):
+            print(f"Upload error: {upload_response.text}")
+            return None
+        return public_url
+    except Exception as e:
+        print(f"Error uploading media: {e}")
+        traceback.print_exc()
+        return None
 
-        sessions[session_id] = {
-            'client': client,
-            'handle': handle,
-            'session_string': session_string,
-            'display_name': getattr(profile, 'display_name', None) or handle,
-        }
 
+# ============================================================
+# FACEBOOK POSTING
+# ============================================================
+
+def create_facebook_post(text, account_id, media_urls=None, scheduled_for=None,
+                         topic_tag=None, is_draft=False, content_type='feed'):
+    try:
+        platform_config = {"platform": "facebook", "accountId": account_id}
+        if content_type and content_type != 'feed':
+            platform_config["platformSpecificData"] = {"contentType": content_type}
+        if topic_tag:
+            platform_config.setdefault("platformSpecificData", {})["topic_tag"] = topic_tag
+
+        payload = {"platforms": [platform_config]}
+        if text and str(text).strip():
+            payload["content"] = str(text).strip()[:2000]
+        if media_urls:
+            payload["mediaItems"] = []
+            for url in media_urls:
+                if url and str(url).startswith(('http://', 'https://')):
+                    payload["mediaItems"].append({"type": "image", "url": url})
+
+        if is_draft:
+            payload["isDraft"] = True
+        elif scheduled_for:
+            payload["scheduledFor"] = scheduled_for
+            payload["timezone"] = TIMEZONE
+        else:
+            payload["publishNow"] = True
+
+        response = requests.post(
+            f"{ZERNIO_BASE_URL}/posts",
+            headers=get_zernio_headers(),
+            json=payload,
+            timeout=30,
+        )
+        print(f"Facebook post response: {response.status_code}")
+        if response.status_code == 201:
+            data = response.json()
+            post = data.get('post') or {}
+            platforms = post.get('platforms') or [{}]
+            return {
+                "success": True,
+                "post_id": post.get('_id'),
+                "status": post.get('status'),
+                "url": platforms[0].get('platformPostUrl') if platforms else None,
+                "scheduled_for": post.get('scheduledFor'),
+            }
+        if response.status_code == 409:
+            error_data = response.json() if response.text else {}
+            return {
+                "success": False,
+                "error": "Duplicate content",
+                "message": error_data.get('message', 'This content was already posted recently'),
+            }
+        try:
+            error_data = response.json()
+            error_msg = error_data.get('message', response.text)
+        except Exception:
+            error_msg = response.text
+        return {"success": False, "error": f"API Error {response.status_code}", "message": error_msg}
+    except Exception as e:
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
+
+
+def get_facebook_account_id(account_id=None, account_username=None):
+    if account_id:
+        return account_id
+    if account_username:
         conn = get_db_connection()
         if conn:
             try:
                 cur = conn.cursor()
                 cur.execute("""
-                    INSERT INTO sessions (session_id, username, handle, display_name, session_string, expires_at)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (session_id) DO UPDATE SET
-                        session_string = EXCLUDED.session_string,
-                        last_used_at = CURRENT_TIMESTAMP,
-                        expires_at = EXCLUDED.expires_at
-                """, (session_id, username, handle, sessions[session_id]['display_name'], session_string, expires))
-                conn.commit()
+                    SELECT account_id FROM zernio_accounts
+                    WHERE username = %s AND platform = 'facebook' AND is_active = TRUE
+                    LIMIT 1
+                """, (account_username,))
+                row = cur.fetchone()
                 cur.close()
                 conn.close()
+                if row:
+                    return row[0]
             except Exception as e:
-                print(f"session save: {e}")
+                print(f"resolve username: {e}")
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT account_id FROM zernio_accounts
+                WHERE platform = 'facebook' AND is_active = TRUE
+                ORDER BY last_sync DESC NULLS LAST, created_at DESC
+                LIMIT 1
+            """)
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+            if row:
+                return row[0]
+        except Exception as e:
+            print(f"get first facebook: {e}")
+            try:
+                conn.close()
+            except Exception:
+                pass
+    accounts = refresh_all_zernio_accounts()
+    for acc in accounts:
+        aid = acc.get('account_id') or acc.get('_id')
+        if aid:
+            return aid
+    return None
 
+
+def resolve_facebook_account_id(account_id=None, account_username=None):
+    return get_facebook_account_id(account_id, account_username)
+
+
+def post_to_facebook(image_url=None, image_bytes=None, caption="", account_id=None,
+                     account_username=None, scheduled_time=None, content_type='feed'):
+    resolved = resolve_facebook_account_id(account_id, account_username)
+    if not resolved:
+        return {"success": False, "error": "No Facebook account resolved. Connect one in Zernio."}
+
+    media_urls = []
+    if image_url:
+        media_urls.append(image_url)
+    elif image_bytes:
+        public = upload_media_to_zernio(image_bytes)
+        if not public:
+            return {"success": False, "error": "Media upload failed"}
+        media_urls.append(public)
+
+    scheduled_for = None
+    if scheduled_time:
+        if isinstance(scheduled_time, datetime):
+            scheduled_for = format_datetime_for_zernio(scheduled_time)
+        else:
+            scheduled_for = scheduled_time
+
+    result = create_facebook_post(
+        text=caption or "",
+        account_id=resolved,
+        media_urls=media_urls or None,
+        scheduled_for=scheduled_for,
+        content_type=content_type or 'feed',
+    )
+    if result.get('success'):
+        result['account_id'] = resolved
+        result['message'] = result.get('message') or (
+            f"Scheduled to Facebook" if scheduled_for else "Posted to Facebook"
+        )
+    return result
+
+
+# ============================================================
+# BLUESKY LOGIN / FETCH
+# ============================================================
+
+def tool_login(username, password):
+    try:
+        username = (username or '').strip().lstrip('@')
+        password = (password or '').strip()
+        if not username or not password:
+            return {"success": False, "error": "Handle and app password required"}
+        client = Client()
+        client.login(username, password)
+        profile = client.me
+        handle = profile.handle
+        display_name = getattr(profile, 'display_name', None) or handle
+        session_string = client.export_session_string()
+        session_id = str(uuid.uuid4())
+        expires = datetime.now() + timedelta(days=30)
+
+        conn = get_db_connection()
+        if conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO sessions (session_id, username, handle, display_name, session_string, expires_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (session_id) DO UPDATE SET
+                    session_string = EXCLUDED.session_string,
+                    last_used_at = CURRENT_TIMESTAMP,
+                    expires_at = EXCLUDED.expires_at
+            """, (session_id, username, handle, display_name, session_string, expires))
+            cur.execute("""
+                INSERT INTO bluesky_accounts (handle, display_name, session_string, is_active, last_used_at)
+                VALUES (%s, %s, %s, TRUE, CURRENT_TIMESTAMP)
+                ON CONFLICT (handle) DO UPDATE SET
+                    session_string = EXCLUDED.session_string,
+                    display_name = EXCLUDED.display_name,
+                    is_active = TRUE,
+                    last_used_at = CURRENT_TIMESTAMP
+            """, (handle, display_name, session_string))
+            conn.commit()
+            cur.close()
+            conn.close()
+
+        sessions[session_id] = {
+            'client': client,
+            'handle': handle,
+            'session_string': session_string,
+            'display_name': display_name,
+        }
         return {
             "success": True,
             "session_id": session_id,
             "handle": handle,
-            "message": f"Logged in as @{handle}"
+            "display_name": display_name,
+            "message": f"Logged in as @{handle}",
         }
     except Exception as e:
+        traceback.print_exc()
         return {"success": False, "error": str(e)}
 
 
-def tool_restore_session(handle_or_sid):
+def tool_restore_session(handle):
+    handle = (handle or '').strip().lstrip('@')
+    if '.' not in handle:
+        handle = handle + '.bsky.social'
     try:
         conn = get_db_connection()
         if not conn:
             return {"success": False, "error": "DB unavailable"}
         cur = conn.cursor()
         cur.execute("""
-            SELECT session_id, session_string, handle FROM sessions
-            WHERE (handle = %s OR session_id = %s) AND expires_at > CURRENT_TIMESTAMP
+            SELECT session_id, session_string, handle, display_name FROM sessions
+            WHERE handle = %s AND expires_at > CURRENT_TIMESTAMP
             ORDER BY last_used_at DESC LIMIT 1
-        """, (handle_or_sid.lstrip('@'), handle_or_sid))
+        """, (handle,))
         row = cur.fetchone()
+        if not row:
+            cur.execute("""
+                SELECT session_string, handle, display_name FROM bluesky_accounts
+                WHERE handle = %s AND is_active = TRUE LIMIT 1
+            """, (handle,))
+            row2 = cur.fetchone()
+            cur.close()
+            conn.close()
+            if not row2:
+                return {"success": False, "error": f"No saved session for @{handle}"}
+            session_string, h, display_name = row2
+            client = Client()
+            client.login(session_string=session_string)
+            session_id = str(uuid.uuid4())
+            sessions[session_id] = {
+                'client': client,
+                'handle': h,
+                'session_string': session_string,
+                'display_name': display_name or h,
+            }
+            return {
+                "success": True,
+                "session_id": session_id,
+                "handle": h,
+                "message": f"Restored session for @{h}",
+            }
+        session_id, session_string, h, display_name = row
         cur.close()
         conn.close()
-        if not row:
-            return {"success": False, "error": f"No valid session for {handle_or_sid}"}
         client = Client()
-        client.login(session_string=row[1])
-        sid = row[0]
-        sessions[sid] = {
+        client.login(session_string=session_string)
+        sessions[session_id] = {
             'client': client,
-            'handle': row[2],
-            'session_string': row[1]
+            'handle': h,
+            'session_string': session_string,
+            'display_name': display_name or h,
         }
         return {
             "success": True,
-            "session_id": sid,
-            "handle": row[2],
-            "message": f"Restored session for @{row[2]}"
+            "session_id": session_id,
+            "handle": h,
+            "message": f"Restored session for @{h}",
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
-def tool_fetch_posts(session_id, actor, limit=15, include_reposts=False, media_only=True):
-    if session_id not in sessions:
-        return {"success": False, "error": "Not logged in / invalid session"}
-    client = sessions[session_id]['client']
-    try:
-        if not actor.endswith('.bsky.social') and '.' not in actor:
-            actor = actor + '.bsky.social'
-        actor = actor.lstrip('@')
+def _get_client_for_session(session_id):
+    if session_id and session_id in sessions:
+        return sessions[session_id]['client'], sessions[session_id]
+    return None, None
 
-        # Prefer get_author_feed
-        feed = client.get_author_feed(actor=actor, limit=min(limit * 2, 50))
+
+def _get_any_bluesky_client():
+    if sessions:
+        sid = list(sessions.keys())[0]
+        return sessions[sid]['client'], sessions[sid]
+    if BLUESKY_MASTER_HANDLE and BLUESKY_MASTER_PASSWORD:
+        try:
+            client = Client()
+            client.login(BLUESKY_MASTER_HANDLE, BLUESKY_MASTER_PASSWORD)
+            return client, {'handle': BLUESKY_MASTER_HANDLE}
+        except Exception as e:
+            print(f"Master login failed: {e}")
+    try:
+        conn = get_db_connection()
+        if conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT session_id, session_string, handle FROM sessions
+                WHERE expires_at > CURRENT_TIMESTAMP
+                ORDER BY last_used_at DESC LIMIT 1
+            """)
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+            if row:
+                sid, ss, handle = row
+                client = Client()
+                client.login(session_string=ss)
+                sessions[sid] = {'client': client, 'handle': handle, 'session_string': ss}
+                return client, sessions[sid]
+    except Exception as e:
+        print(f"Restore any session: {e}")
+    return None, None
+
+
+def tool_fetch_posts(session_id, actor, limit=15, media_only=True, include_reposts=False):
+    try:
+        client, meta = _get_client_for_session(session_id)
+        if not client:
+            client, meta = _get_any_bluesky_client()
+        if not client:
+            return {"success": False, "error": "Not logged in. Login with handle and app-password."}
+
+        actor = (actor or '').strip().lstrip('@')
+        if '.' not in actor:
+            actor = actor + '.bsky.social'
+
+        feed = client.get_author_feed(actor=actor, limit=min(int(limit or 15), 50))
         posts = []
         for item in feed.feed:
             post = item.post
-            # Skip reposts unless requested
-            if hasattr(item, 'reason') and item.reason and not include_reposts:
+            # skip reposts if not wanted
+            if not include_reposts and getattr(item, 'reason', None) is not None:
                 continue
             record = post.record
             text = getattr(record, 'text', '') or ''
             images = []
-            video = None
             embed = getattr(record, 'embed', None)
             if embed:
-                # images
-                if hasattr(embed, 'images') and embed.images:
-                    for im in embed.images:
-                        thumb = None
-                        full = None
-                        if hasattr(im, 'thumb') and im.thumb:
-                            thumb = client.uri_to_url(im.thumb) if hasattr(client, 'uri_to_url') else None
-                        if hasattr(im, 'fullsize') and im.fullsize:
-                            full = client.uri_to_url(im.fullsize) if hasattr(client, 'uri_to_url') else None
-                        # Prefer CDN from post.embed if available
-                        images.append({
-                            "url": full or thumb or "",
-                            "thumb": thumb or full or "",
-                            "alt": getattr(im, 'alt', '') or ''
-                        })
-                # recordWithMedia / external etc.
-                if hasattr(embed, 'media') and embed.media and hasattr(embed.media, 'images'):
-                    for im in embed.media.images:
-                        images.append({
-                            "url": getattr(im, 'fullsize', None) or getattr(im, 'thumb', None) or "",
-                            "thumb": getattr(im, 'thumb', None) or "",
-                            "alt": getattr(im, 'alt', '') or ''
-                        })
-
-            # Pull richer image URLs from view
+                images_embed = getattr(embed, 'images', None)
+                if images_embed:
+                    for im in images_embed:
+                        full = getattr(getattr(im, 'image', None), 'ref', None)
+                        # Prefer CDN URLs from post.embed if available
+                        pass
+                # Prefer post.embed view
             view_embed = getattr(post, 'embed', None)
             if view_embed:
-                if hasattr(view_embed, 'images') and view_embed.images:
-                    images = []
-                    for im in view_embed.images:
-                        images.append({
-                            "url": getattr(im, 'fullsize', None) or getattr(im, 'thumb', None) or "",
-                            "thumb": getattr(im, 'thumb', None) or "",
-                            "alt": getattr(im, 'alt', '') or ''
-                        })
-                if hasattr(view_embed, 'media') and view_embed.media and hasattr(view_embed.media, 'images'):
-                    images = []
-                    for im in view_embed.media.images:
-                        images.append({
-                            "url": getattr(im, 'fullsize', None) or getattr(im, 'thumb', None) or "",
-                            "thumb": getattr(im, 'thumb', None) or "",
-                            "alt": getattr(im, 'alt', '') or ''
-                        })
+                imgs = getattr(view_embed, 'images', None)
+                if imgs:
+                    for im in imgs:
+                        url = getattr(im, 'fullsize', None) or getattr(im, 'thumb', None)
+                        if url:
+                            images.append({"url": url, "thumb": getattr(im, 'thumb', url)})
+                media = getattr(view_embed, 'media', None)
+                if media and hasattr(media, 'images'):
+                    for im in media.images:
+                        url = getattr(im, 'fullsize', None) or getattr(im, 'thumb', None)
+                        if url:
+                            images.append({"url": url, "thumb": getattr(im, 'thumb', url)})
 
-            if media_only and not images and not video:
+            if media_only and not images:
                 continue
 
-            author = post.author
+            uri = post.uri
+            author = post.author.handle if post.author else actor
+            display_name = getattr(post.author, 'display_name', None) or author
+            likes = getattr(post, 'like_count', 0) or 0
+            reposts = getattr(post, 'repost_count', 0) or 0
+            replies = getattr(post, 'reply_count', 0) or 0
+            created = getattr(record, 'created_at', None)
+
             posts.append({
-                "uri": post.uri,
-                "cid": post.cid,
-                "author": author.handle,
-                "display_name": getattr(author, 'display_name', None) or author.handle,
+                "uri": uri,
+                "author": author,
+                "display_name": display_name,
                 "text": text,
                 "images": images,
-                "video": video,
-                "likes": getattr(post, 'like_count', 0) or 0,
-                "reposts": getattr(post, 'repost_count', 0) or 0,
-                "replies": getattr(post, 'reply_count', 0) or 0,
-                "created_at": getattr(record, 'created_at', None),
+                "likes": likes,
+                "reposts": reposts,
+                "replies": replies,
+                "created_at": created,
             })
-            if len(posts) >= limit:
-                break
 
-        return {"success": True, "posts": posts, "count": len(posts), "actor": actor}
+        if session_id and session_id in sessions:
+            sessions[session_id]['_last_fetched'] = posts
+            sessions[session_id]['_last_actor'] = actor
+
+        return {
+            "success": True,
+            "posts": posts,
+            "count": len(posts),
+            "actor": actor,
+            "message": f"Fetched {len(posts)} posts from @{actor}",
+        }
     except Exception as e:
         traceback.print_exc()
         return {"success": False, "error": str(e)}
@@ -1415,11 +1506,12 @@ def tool_fetch_posts(session_id, actor, limit=15, include_reposts=False, media_o
 def tool_add_to_vault(posts, handler_handle=None):
     if not posts:
         return {"success": False, "error": "No posts to save"}
-    conn = get_db_connection()
-    if not conn:
-        return {"success": False, "error": "DB unavailable"}
     saved = 0
+    skipped = 0
     try:
+        conn = get_db_connection()
+        if not conn:
+            return {"success": False, "error": "Database unavailable"}
         cur = conn.cursor()
         for p in posts:
             uri = p.get('uri')
@@ -1427,52 +1519,55 @@ def tool_add_to_vault(posts, handler_handle=None):
                 continue
             try:
                 cur.execute("""
-                    INSERT INTO vault (uri, author, display_name, text, images, video, likes, reposts, replies, created_at, handler_handle)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO vault (uri, author, display_name, text, images, likes, reposts, replies, created_at, handler_handle)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (uri) DO NOTHING
                 """, (
                     uri,
-                    p.get('author') or '',
+                    p.get('author') or 'unknown',
                     p.get('display_name'),
                     p.get('text'),
                     Json(p.get('images') or []),
-                    Json(p.get('video')) if p.get('video') else None,
-                    p.get('likes') or 0,
-                    p.get('reposts') or 0,
-                    p.get('replies') or 0,
+                    int(p.get('likes') or 0),
+                    int(p.get('reposts') or 0),
+                    int(p.get('replies') or 0),
                     p.get('created_at'),
                     handler_handle or p.get('author'),
                 ))
-                if cur.rowcount > 0:
+                if cur.rowcount:
                     saved += 1
+                else:
+                    skipped += 1
             except Exception as e:
-                print(f"vault insert {uri}: {e}")
+                print(f"vault insert: {e}")
+                skipped += 1
         conn.commit()
         cur.close()
         conn.close()
         return {
             "success": True,
             "saved": saved,
-            "message": f"Saved {saved} post(s) to vault"
+            "skipped": skipped,
+            "message": f"Saved {saved} to vault ({skipped} already present)",
         }
     except Exception as e:
         traceback.print_exc()
         return {"success": False, "error": str(e)}
 
 
-def tool_list_vault(limit=20, offset=0):
-    conn = get_db_connection()
-    if not conn:
-        return {"success": False, "error": "DB unavailable"}
+def tool_list_vault(limit=15):
     try:
+        conn = get_db_connection()
+        if not conn:
+            return {"success": False, "error": "DB unavailable"}
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
-            SELECT id, uri, author, display_name, text, images, video, likes, reposts, replies,
+            SELECT id, uri, author, display_name, text, images, likes, reposts, replies,
                    created_at, saved_at, handler_handle, notes
             FROM vault
             ORDER BY saved_at DESC
-            LIMIT %s OFFSET %s
-        """, (limit, offset))
+            LIMIT %s
+        """, (int(limit or 15),))
         rows = cur.fetchall()
         cur.execute("SELECT COUNT(*) FROM vault")
         total = cur.fetchone()['count']
@@ -1480,255 +1575,129 @@ def tool_list_vault(limit=20, offset=0):
         conn.close()
         vault = []
         for r in rows:
-            vault.append({
-                "id": r['id'],
-                "uri": r['uri'],
-                "author": r['author'],
-                "display_name": r['display_name'],
-                "text": r['text'],
-                "images": r['images'] or [],
-                "video": r['video'],
-                "likes": r['likes'],
-                "reposts": r['reposts'],
-                "replies": r['replies'],
-                "created_at": r['created_at'].isoformat() if r['created_at'] else None,
-                "saved_at": r['saved_at'].isoformat() if r['saved_at'] else None,
-                "handler_handle": r['handler_handle'],
-                "notes": r['notes'],
-            })
-        # ✅ IMPORTANT: Return count in the result
+            item = dict(r)
+            if item.get('images') and isinstance(item['images'], str):
+                try:
+                    item['images'] = json.loads(item['images'])
+                except Exception:
+                    pass
+            vault.append(item)
         return {"success": True, "vault": vault, "count": total}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-# ============================================================
-# VAULT MANAGEMENT WITH POST STATUS - ADD THIS SECTION
-# ============================================================
 
-def tool_list_vault_by_status(status=None, limit=50, offset=0):
-    """List vault items filtered by post status."""
-    conn = get_db_connection()
-    if not conn:
-        return {"success": False, "error": "DB unavailable"}
+def tool_list_vault_by_status(status='all', limit=50):
     try:
+        conn = get_db_connection()
+        if not conn:
+            return {"success": False, "error": "DB unavailable"}
         cur = conn.cursor(cursor_factory=RealDictCursor)
-        
+        limit = int(limit or 50)
         if status == 'unposted':
             cur.execute("""
-                SELECT v.id, v.uri, v.author, v.display_name, v.text, v.images, v.video, 
-                       v.likes, v.reposts, v.replies, v.created_at, v.saved_at, 
-                       v.handler_handle, v.notes,
-                       NULL as post_status, NULL as posted_at, NULL as platform_post_id
-                FROM vault v
+                SELECT v.* FROM vault v
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM posted_posts p 
-                    WHERE p.uri = v.uri AND p.status IN ('completed', 'posted')
+                    SELECT 1 FROM posted_posts p
+                    WHERE p.uri = v.uri AND p.platform = 'facebook'
+                      AND p.status IN ('completed', 'posted', 'scheduled')
                 )
-                ORDER BY v.saved_at DESC
-                LIMIT %s OFFSET %s
-            """, (limit, offset))
-        elif status in ('posted', 'completed'):
+                ORDER BY v.saved_at DESC LIMIT %s
+            """, (limit,))
+        elif status == 'posted':
             cur.execute("""
-                SELECT v.id, v.uri, v.author, v.display_name, v.text, v.images, v.video, 
-                       v.likes, v.reposts, v.replies, v.created_at, v.saved_at, 
-                       v.handler_handle, v.notes,
-                       p.status as post_status, p.posted_at, p.platform_post_id
-                FROM vault v
-                INNER JOIN posted_posts p ON p.uri = v.uri
-                WHERE p.status IN ('completed', 'posted')
-                ORDER BY p.posted_at DESC
-                LIMIT %s OFFSET %s
-            """, (limit, offset))
+                SELECT v.* FROM vault v
+                WHERE EXISTS (
+                    SELECT 1 FROM posted_posts p
+                    WHERE p.uri = v.uri AND p.platform = 'facebook'
+                      AND p.status IN ('completed', 'posted')
+                )
+                ORDER BY v.saved_at DESC LIMIT %s
+            """, (limit,))
         elif status == 'scheduled':
             cur.execute("""
-                SELECT v.id, v.uri, v.author, v.display_name, v.text, v.images, v.video, 
-                       v.likes, v.reposts, v.replies, v.created_at, v.saved_at, 
-                       v.handler_handle, v.notes,
-                       p.status as post_status, p.posted_at, p.platform_post_id
-                FROM vault v
-                INNER JOIN posted_posts p ON p.uri = v.uri
-                WHERE p.status = 'scheduled'
-                ORDER BY p.posted_at DESC
-                LIMIT %s OFFSET %s
-            """, (limit, offset))
-        else:
-            cur.execute("""
-                SELECT v.id, v.uri, v.author, v.display_name, v.text, v.images, v.video, 
-                       v.likes, v.reposts, v.replies, v.created_at, v.saved_at, 
-                       v.handler_handle, v.notes,
-                       COALESCE(p.status, 'unposted') as post_status, 
-                       p.posted_at, p.platform_post_id
-                FROM vault v
-                LEFT JOIN posted_posts p ON p.uri = v.uri
-                ORDER BY v.saved_at DESC
-                LIMIT %s OFFSET %s
-            """, (limit, offset))
-        
-        rows = cur.fetchall()
-        
-        if status == 'unposted':
-            cur.execute("""
-                SELECT COUNT(*) FROM vault v
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM posted_posts p 
-                    WHERE p.uri = v.uri AND p.status IN ('completed', 'posted')
+                SELECT v.* FROM vault v
+                WHERE EXISTS (
+                    SELECT 1 FROM posted_posts p
+                    WHERE p.uri = v.uri AND p.platform = 'facebook' AND p.status = 'scheduled'
                 )
-            """)
-        elif status in ('posted', 'completed'):
-            cur.execute("""
-                SELECT COUNT(*) FROM vault v
-                INNER JOIN posted_posts p ON p.uri = v.uri
-                WHERE p.status IN ('completed', 'posted')
-            """)
-        elif status == 'scheduled':
-            cur.execute("""
-                SELECT COUNT(*) FROM vault v
-                INNER JOIN posted_posts p ON p.uri = v.uri
-                WHERE p.status = 'scheduled'
-            """)
+                ORDER BY v.saved_at DESC LIMIT %s
+            """, (limit,))
         else:
-            cur.execute("SELECT COUNT(*) FROM vault")
-        
-        total = cur.fetchone()['count']
+            cur.execute("SELECT * FROM vault ORDER BY saved_at DESC LIMIT %s", (limit,))
+        rows = [dict(r) for r in cur.fetchall()]
         cur.close()
         conn.close()
-        
-        vault = []
-        for r in rows:
-            vault.append({
-                "id": r['id'],
-                "uri": r['uri'],
-                "author": r['author'],
-                "display_name": r['display_name'],
-                "text": r['text'],
-                "images": r['images'] or [],
-                "video": r['video'],
-                "likes": r['likes'],
-                "reposts": r['reposts'],
-                "replies": r['replies'],
-                "created_at": r['created_at'].isoformat() if r['created_at'] else None,
-                "saved_at": r['saved_at'].isoformat() if r['saved_at'] else None,
-                "handler_handle": r['handler_handle'],
-                "notes": r['notes'],
-                "post_status": r.get('post_status') or 'unposted',
-                "posted_at": r['posted_at'].isoformat() if r.get('posted_at') else None,
-                "platform_post_id": r.get('platform_post_id'),
-            })
-        return {"success": True, "vault": vault, "count": total, "status_filter": status or 'all'}
+        return {"success": True, "vault": rows, "count": len(rows), "status": status}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 def tool_delete_vault_items(ids=None, status=None, all=False):
-    """Delete vault items by ID, by status, or all."""
     try:
         conn = get_db_connection()
         if not conn:
-            return {"success": False, "error": "Database unavailable"}
-        
+            return {"success": False, "error": "DB unavailable"}
         cur = conn.cursor()
-        deleted_count = 0
-        deleted_uris = []
-        
-        if ids and isinstance(ids, list):
-            placeholders = ','.join(['%s'] * len(ids))
-            cur.execute(f"SELECT id, uri FROM vault WHERE id IN ({placeholders})", ids)
-            items = cur.fetchall()
+        deleted = 0
+        if all:
+            cur.execute("DELETE FROM vault")
+            deleted = cur.rowcount
+        elif ids:
+            cur.execute("DELETE FROM vault WHERE id = ANY(%s)", (list(ids),))
+            deleted = cur.rowcount
         elif status == 'unposted':
             cur.execute("""
-                SELECT id, uri FROM vault v
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM posted_posts p 
-                    WHERE p.uri = v.uri AND p.status IN ('completed', 'posted')
+                DELETE FROM vault v WHERE NOT EXISTS (
+                    SELECT 1 FROM posted_posts p WHERE p.uri = v.uri AND p.platform = 'facebook'
                 )
             """)
-            items = cur.fetchall()
-        elif status in ('posted', 'completed'):
+            deleted = cur.rowcount
+        elif status in ('posted', 'scheduled'):
+            st = 'posted' if status == 'posted' else 'scheduled'
             cur.execute("""
-                SELECT v.id, v.uri FROM vault v
-                INNER JOIN posted_posts p ON p.uri = v.uri
-                WHERE p.status IN ('completed', 'posted')
-            """)
-            items = cur.fetchall()
-        elif status == 'scheduled':
-            cur.execute("""
-                SELECT v.id, v.uri FROM vault v
-                INNER JOIN posted_posts p ON p.uri = v.uri
-                WHERE p.status = 'scheduled'
-            """)
-            items = cur.fetchall()
-        elif all:
-            cur.execute("SELECT id, uri FROM vault")
-            items = cur.fetchall()
-        else:
-            return {"success": False, "error": "Specify ids, status, or all=True"}
-        
-        if not items:
-            cur.close()
-            conn.close()
-            return {"success": True, "deleted_count": 0, "message": "No items to delete"}
-        
-        for item in items:
-            item_id, uri = item
-            cur.execute("DELETE FROM posted_posts WHERE uri = %s", (uri,))
-            cur.execute("DELETE FROM vault WHERE id = %s", (item_id,))
-            deleted_count += 1
-            deleted_uris.append(uri)
-        
+                DELETE FROM vault v WHERE EXISTS (
+                    SELECT 1 FROM posted_posts p
+                    WHERE p.uri = v.uri AND p.platform = 'facebook' AND p.status = %s
+                )
+            """, (st if st == 'scheduled' else 'posted',))
+            deleted = cur.rowcount
         conn.commit()
         cur.close()
         conn.close()
-        
-        return {
-            "success": True,
-            "deleted_count": deleted_count,
-            "deleted_uris": deleted_uris,
-            "message": f"Deleted {deleted_count} item(s) from vault"
-        }
+        return {"success": True, "deleted_count": deleted, "message": f"Deleted {deleted} vault item(s)"}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
-def tool_post_unposted(account_id=None, account_username=None, limit=10):
-    """Post all unposted vault items to Facebook."""
-    result = tool_list_vault_by_status(status='unposted', limit=limit)
-    if not result.get('success'):
-        return result
-    
-    items = result.get('vault', [])
-    if not items:
-        return {"success": True, "posted_count": 0, "message": "No unposted items to post"}
-    
-    posted = 0
-    errors = []
-    results = []
-    
-    for item in items:
-        res = tool_post_now(
-            vault_id=item.get('id'),
-            account_id=account_id,
-            account_username=account_username
-        )
-        results.append(res)
-        if res.get('success'):
-            posted += 1
-        else:
-            errors.append(res.get('error', 'Unknown error'))
-        time.sleep(1.5)
-    
-    return {
-        "success": posted > 0,
-        "posted_count": posted,
-        "total": len(items),
-        "results": results,
-        "errors": errors,
-        "message": f"Posted {posted}/{len(items)} unposted items to Facebook"
-    }
-def _get_vault_item(vault_id=None, uri=None):
-    conn = get_db_connection()
-    if not conn:
-        return None
+def _mark_posted(vault_id, uri, platform_post_id=None, status='posted', error=None, metadata=None):
     try:
+        conn = get_db_connection()
+        if not conn:
+            return
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO posted_posts (vault_id, uri, platform, platform_post_id, status, error_message, metadata)
+            VALUES (%s, %s, 'facebook', %s, %s, %s, %s)
+            ON CONFLICT (uri, platform) DO UPDATE SET
+                status = EXCLUDED.status,
+                platform_post_id = COALESCE(EXCLUDED.platform_post_id, posted_posts.platform_post_id),
+                error_message = EXCLUDED.error_message,
+                posted_at = CURRENT_TIMESTAMP,
+                metadata = COALESCE(EXCLUDED.metadata, posted_posts.metadata)
+        """, (vault_id, uri, platform_post_id, status, error, Json(metadata) if metadata else None))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"mark posted: {e}")
+
+
+def tool_post_now(vault_id=None, uri=None, caption=None, account_username=None, account_id=None, content_type='feed'):
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return {"success": False, "error": "DB unavailable"}
         cur = conn.cursor(cursor_factory=RealDictCursor)
         if vault_id is not None:
             cur.execute("SELECT * FROM vault WHERE id = %s", (int(vault_id),))
@@ -1737,752 +1706,781 @@ def _get_vault_item(vault_id=None, uri=None):
         else:
             cur.close()
             conn.close()
-            return None
+            return {"success": False, "error": "vault_id or uri required"}
         row = cur.fetchone()
         cur.close()
         conn.close()
-        return dict(row) if row else None
-    except Exception as e:
-        print(f"_get_vault_item: {e}")
-        return None
-
-
-def _download_image_to_bytes(url):
-    try:
-        r = requests.get(url, timeout=30)
-        if r.status_code == 200:
-            return BytesIO(r.content)
-    except Exception as e:
-        print(f"download image: {e}")
-    return None
-
-
-def tool_post_now(uri=None, vault_id=None, caption=None, account_id=None, account_username=None, content_type='feed'):
-    """Post a vault item (or by uri) to Facebook now."""
-    item = _get_vault_item(vault_id=vault_id, uri=uri)
-    if not item:
-        return {"success": False, "error": "Vault item not found"}
-
-    images = item.get('images') or []
-    image_url = None
-    if images:
-        first = images[0]
-        if isinstance(first, str):
-            image_url = first
-        else:
-            image_url = first.get('url') or first.get('fullsize') or first.get('thumb')
-
-    text = (caption if caption is not None and str(caption).strip() != '' else (item.get('text') or ''))[:2000]
-
-    # Prefer re-upload via Zernio for reliability
-    image_bytes = None
-    public_url = None
-    if image_url and image_url.startswith(('http://', 'https://')):
-        image_bytes = _download_image_to_bytes(image_url)
-        if image_bytes:
-            image_bytes = fix_image_for_feed(image_bytes)
-            public_url = upload_media_to_zernio(image_bytes)
-        else:
-            public_url = image_url  # try direct URL
-
-    if not public_url and not image_bytes:
-        # Text-only Facebook post
-        result = post_to_facebook(
-            image_url=None,
-            caption=text,
-            account_id=account_id,
-            account_username=account_username,
-            scheduled_time=None
-        )
-    else:
-        result = post_to_facebook(
-            image_url=public_url,
-            caption=text,
-            account_id=account_id,
-            account_username=account_username,
-            scheduled_time=None
-        )
-
-    if result.get('success'):
-        # record posted
-        try:
-            conn = get_db_connection()
-            if conn:
-                cur = conn.cursor()
-                cur.execute("""
-                    INSERT INTO posted_posts (vault_id, uri, platform, platform_post_id, status, metadata)
-                    VALUES (%s, %s, 'facebook', %s, 'posted', %s)
-                    ON CONFLICT (uri, platform) DO UPDATE SET
-                        platform_post_id = EXCLUDED.platform_post_id,
-                        status = 'posted',
-                        posted_at = CURRENT_TIMESTAMP
-                """, (
-                    item.get('id'),
-                    item.get('uri'),
-                    result.get('post_id'),
-                    Json({"account_id": result.get('account_id')})
-                ))
-                conn.commit()
-                cur.close()
-                conn.close()
-        except Exception as e:
-            print(f"posted_posts: {e}")
-        result['message'] = f"✅ Posted to Facebook (vault id={item.get('id')})"
-        result['vault_id'] = item.get('id')
-
-    return result
-
-
-def tool_post_vault_batch(count=3, account_id=None, account_username=None, content_type='feed'):
-    r = tool_list_vault(limit=max(count * 2, 10))
-    items = r.get('vault') or []
-    # prefer items with images that aren't already posted
-    posted_uris = set()
-    try:
-        conn = get_db_connection()
-        if conn:
-            cur = conn.cursor()
-            cur.execute("SELECT uri FROM posted_posts WHERE platform = 'facebook' AND status = 'posted'")
-            posted_uris = {row[0] for row in cur.fetchall()}
-            cur.close()
-            conn.close()
-    except Exception:
-        pass
-
-    chosen = []
-    for it in items:
-        if it.get('uri') in posted_uris:
-            continue
-        chosen.append(it)
-        if len(chosen) >= count:
-            break
-
-    results = []
-    posted = 0
-    for it in chosen:
-        res = tool_post_now(
-            vault_id=it.get('id'),
-            account_id=account_id,
-            account_username=account_username
-        )
-        results.append(res)
-        if res.get('success'):
-            posted += 1
-        time.sleep(1.5)
-
-    return {
-        "success": posted > 0,
-        "posted_count": posted,
-        "results": results,
-        "message": f"Posted {posted}/{len(chosen)} items to Facebook"
-    }
-
-
-def tool_list_accounts(platform='facebook'):
-    """List Facebook accounts only."""
-    platform = (platform or 'facebook').lower()
-    if platform != 'facebook':
-        return {
-            "success": True,
-            "accounts": [],
-            "count": 0,
-            "message": "Only Facebook accounts are supported."
-        }
-
-    # Deactivate any non-Facebook rows left from older installs
-    conn = get_db_connection()
-    if conn:
-        try:
-            cur = conn.cursor()
-            cur.execute("""
-                UPDATE zernio_accounts
-                SET is_active = FALSE
-                WHERE LOWER(COALESCE(platform, '')) NOT IN ('facebook')
-                  AND is_active = TRUE
-            """)
-            if cur.rowcount:
-                print(f"🧹 Deactivated {cur.rowcount} non-Facebook account row(s)")
-            conn.commit()
-            cur.close()
-        except Exception as e:
-            print(f"deactivate non-facebook: {e}")
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-    accounts = []
-    conn = get_db_connection()
-    if conn:
-        try:
-            cur = conn.cursor(cursor_factory=RealDictCursor)
-            cur.execute("""
-                SELECT account_id, username, display_name, profile_picture, platform, is_active, last_sync
-                FROM zernio_accounts
-                WHERE LOWER(platform) = 'facebook' AND is_active = TRUE
-                ORDER BY last_sync DESC NULLS LAST
-            """)
-            for row in cur.fetchall():
-                accounts.append({
-                    "account_id": row['account_id'],
-                    "label": row['username'] or row['display_name'],
-                    "username": row['username'],
-                    "display_name": row['display_name'],
-                    "platform": "facebook",
-                    "profile_picture": row['profile_picture'],
-                })
-            cur.close()
-            conn.close()
-        except Exception as e:
-            print(f"list accounts: {e}")
-
-    if not accounts:
-        refresh_all_zernio_accounts()
-        # one-shot re-read without infinite recursion
-        conn = get_db_connection()
-        if conn:
-            try:
-                cur = conn.cursor(cursor_factory=RealDictCursor)
-                cur.execute("""
-                    SELECT account_id, username, display_name, profile_picture
-                    FROM zernio_accounts
-                    WHERE LOWER(platform) = 'facebook' AND is_active = TRUE
-                    ORDER BY last_sync DESC NULLS LAST
-                """)
-                for row in cur.fetchall():
-                    accounts.append({
-                        "account_id": row['account_id'],
-                        "label": row['username'] or row['display_name'],
-                        "username": row['username'],
-                        "display_name": row['display_name'],
-                        "platform": "facebook",
-                        "profile_picture": row['profile_picture'],
-                    })
-                cur.close()
-                conn.close()
-            except Exception as e:
-                print(f"list accounts retry: {e}")
-
-    if not accounts:
-        return {
-            "success": True,
-            "accounts": [],
-            "count": 0,
-            "message": "No Facebook accounts connected. Connect a Facebook account in Zernio and set ZERNIO_API_KEY."
-        }
-
-    lines = [f"Facebook accounts ({len(accounts)}):"]
-    for a in accounts:
-        lines.append(f"• @{a.get('label')} — facebook — id={a.get('account_id')}")
-    return {
-        "success": True,
-        "accounts": accounts,
-        "count": len(accounts),
-        "message": "\n".join(lines),
-        "destination": "facebook",
-    }
-
-
-def tool_list_api_keys():
-    status = ensure_zernio_keys_loaded()
-    return {
-        "success": status.get('success'),
-        "count": status.get('count'),
-        "message": status.get('message'),
-        "keys_preview": status.get('keys_preview'),
-    }
-
-
-def tool_get_status():
-    vault_count = scheduled_count = posted_count = accounts_count = 0
-    active_handle = None
-    try:
-        conn = get_db_connection()
-        if conn:
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM vault")
-            vault_count = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(*) FROM posted_posts WHERE platform = 'facebook'")
-            posted_count = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(*) FROM zernio_accounts WHERE platform = 'facebook' AND is_active = TRUE")
-            accounts_count = cur.fetchone()[0]
-            cur.close()
-            conn.close()
-    except Exception as e:
-        print(f"status: {e}")
-
-    for s in sessions.values():
-        if s.get('handle'):
-            active_handle = s['handle']
-            break
-
-    return {
-        "success": True,
-        "vault_count": vault_count,
-        "scheduled_count": scheduled_count,
-        "posted_count": posted_count,
-        "accounts_count": accounts_count,
-        "active_handle": active_handle,
-        "platform": "facebook",
-        "destination": "facebook",
-        "message": (
-            f"Destination: Facebook only · Vault: {vault_count} · "
-            f"Posted (Facebook): {posted_count} · Facebook accounts: {accounts_count}"
-            + (f" · Bluesky login: @{active_handle}" if active_handle else " · No Bluesky session")
-        )
-    }
-
-
-def tool_list_scheduled():
-    # Zernio scheduled posts listing — optional lightweight
-    try:
-        headers = get_zernio_headers()
-        if not headers:
-            return {"success": True, "scheduled": [], "count": 0, "message": "No Zernio key"}
-        response = requests.get(
-            f"{ZERNIO_BASE_URL}/posts",
-            headers=headers,
-            params={"status": "scheduled", "limit": 50},
-            timeout=15
-        )
-        if response.status_code != 200:
-            return {"success": True, "scheduled": [], "count": 0}
-        data = response.json()
-        posts = data.get('posts') or data.get('data') or []
-        items = []
-        for p in posts:
-            platforms = p.get('platforms') or []
-            is_facebook = any((pl.get('platform') or '').lower() == 'facebook' for pl in platforms)
-            if not is_facebook:
-                continue
-            items.append({
-                "id": p.get('_id'),
-                "text": (p.get('content') or '')[:120],
-                "scheduled_for": p.get('scheduledFor'),
-                "has_image": bool(p.get('mediaItems')),
-                "status": p.get('status'),
-            })
-        return {"success": True, "scheduled": items, "count": len(items)}
-    except Exception as e:
-        return {"success": False, "error": str(e), "scheduled": [], "count": 0}
-
-
-# ============================================================
-# AUTO PILOT (Bluesky → Facebook)
-# ============================================================
-
-_auto_thread = None
-_auto_stop = threading.Event()
-
-
-def _load_auto_config(name='default'):
-    try:
-        conn = get_db_connection()
-        if not conn:
-            return None
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM auto_config WHERE name = %s", (name,))
-        row = cur.fetchone()
         if not row:
-            cur.close()
-            conn.close()
-            return None
-        cols = [d[0] for d in cur.description]
-        cur.close()
-        conn.close()
-        return dict(zip(cols, row))
-    except Exception as e:
-        print(f"load auto_config: {e}")
-        return None
+            return {"success": False, "error": "Vault item not found"}
 
+        item = dict(row)
+        images = item.get('images') or []
+        if isinstance(images, str):
+            try:
+                images = json.loads(images)
+            except Exception:
+                images = []
+        image_url = None
+        if images:
+            first = images[0]
+            image_url = first.get('url') if isinstance(first, dict) else first
 
-def _list_auto_configs():
-    try:
-        conn = get_db_connection()
-        if not conn:
-            return []
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM auto_config ORDER BY name")
-        rows = cur.fetchall()
-        cols = [d[0] for d in cur.description]
-        cur.close()
-        conn.close()
-        return [dict(zip(cols, r)) for r in rows]
-    except Exception as e:
-        print(f"list auto_configs: {e}")
-        return []
-
-
-def _save_auto_config(cfg: dict):
-    try:
-        conn = get_db_connection()
-        if not conn:
-            return False
-        cur = conn.cursor()
-        cur.execute('''
-            INSERT INTO auto_config (
-                name, enabled, source_handle, account_id, account_username,
-                content_type, poll_interval_sec, media_only, include_reposts,
-                max_posts_per_run, bluesky_handle, bluesky_app_password,
-                last_run_at, last_error, last_result, updated_at
-            ) VALUES (
-                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,CURRENT_TIMESTAMP
-            )
-            ON CONFLICT (name) DO UPDATE SET
-                enabled = EXCLUDED.enabled,
-                source_handle = COALESCE(EXCLUDED.source_handle, auto_config.source_handle),
-                account_id = COALESCE(EXCLUDED.account_id, auto_config.account_id),
-                account_username = COALESCE(EXCLUDED.account_username, auto_config.account_username),
-                content_type = COALESCE(EXCLUDED.content_type, auto_config.content_type),
-                poll_interval_sec = COALESCE(EXCLUDED.poll_interval_sec, auto_config.poll_interval_sec),
-                media_only = COALESCE(EXCLUDED.media_only, auto_config.media_only),
-                include_reposts = COALESCE(EXCLUDED.include_reposts, auto_config.include_reposts),
-                max_posts_per_run = COALESCE(EXCLUDED.max_posts_per_run, auto_config.max_posts_per_run),
-                bluesky_handle = COALESCE(EXCLUDED.bluesky_handle, auto_config.bluesky_handle),
-                bluesky_app_password = COALESCE(EXCLUDED.bluesky_app_password, auto_config.bluesky_app_password),
-                last_run_at = COALESCE(EXCLUDED.last_run_at, auto_config.last_run_at),
-                last_error = EXCLUDED.last_error,
-                last_result = EXCLUDED.last_result,
-                updated_at = CURRENT_TIMESTAMP
-        ''', (
-            cfg.get('name', 'default'),
-            bool(cfg.get('enabled', False)),
-            cfg.get('source_handle'),
-            cfg.get('account_id'),
-            cfg.get('account_username'),
-            cfg.get('content_type', 'feed'),
-            int(cfg.get('poll_interval_sec') or 300),
-            bool(cfg.get('media_only', True)),
-            bool(cfg.get('include_reposts', False)),
-            int(cfg.get('max_posts_per_run') or 2),
-            cfg.get('bluesky_handle'),
-            cfg.get('bluesky_app_password'),
-            cfg.get('last_run_at'),
-            cfg.get('last_error'),
-            cfg.get('last_result'),
-        ))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return True
-    except Exception as e:
-        print(f"save auto_config: {e}")
-        traceback.print_exc()
-        return False
-
-
-def _auto_seen(uri, config_name='default'):
-    try:
-        conn = get_db_connection()
-        if not conn:
-            return True
-        cur = conn.cursor()
-        cur.execute("SELECT id FROM auto_seen WHERE config_name=%s AND uri=%s", (config_name, uri))
-        exists = cur.fetchone() is not None
-        cur.close()
-        conn.close()
-        return exists
-    except Exception:
-        return True
-
-
-def _auto_mark_seen(uri, posted=False, config_name='default'):
-    try:
-        conn = get_db_connection()
-        if not conn:
-            return
-        cur = conn.cursor()
-        cur.execute('''
-            INSERT INTO auto_seen (config_name, uri, posted)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (config_name, uri) DO UPDATE SET posted = EXCLUDED.posted
-        ''', (config_name, uri, posted))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"auto_mark_seen: {e}")
-
-
-def _get_bluesky_client_for_auto(cfg):
-    for sid, s in sessions.items():
-        if s.get('client'):
-            return s['client'], sid
-
-    login_handle = cfg.get('bluesky_handle')
-    try:
-        conn = get_db_connection()
-        if conn:
-            cur = conn.cursor()
-            row = None
-            if login_handle:
-                cur.execute('''
-                    SELECT session_id, session_string, handle FROM sessions
-                    WHERE handle = %s AND expires_at > CURRENT_TIMESTAMP
-                    ORDER BY last_used_at DESC LIMIT 1
-                ''', (login_handle,))
-                row = cur.fetchone()
-            if not row:
-                cur.execute('''
-                    SELECT session_id, session_string, handle FROM sessions
-                    WHERE expires_at > CURRENT_TIMESTAMP
-                    ORDER BY last_used_at DESC LIMIT 1
-                ''')
-                row = cur.fetchone()
-            cur.close()
-            conn.close()
-            if row:
-                client = Client()
-                client.login(session_string=row[1])
-                sid = row[0]
-                sessions[sid] = {
-                    'client': client,
-                    'handle': row[2],
-                    'session_string': row[1]
-                }
-                print(f"✅ Auto restored Bluesky session for @{row[2]}")
-                return client, sid
-    except Exception as e:
-        print(f"auto restore session: {e}")
-
-    bsky_user = cfg.get('bluesky_handle')
-    bsky_pass = cfg.get('bluesky_app_password')
-    if bsky_user and bsky_pass:
-        result = tool_login(bsky_user, bsky_pass)
-        if result.get('success'):
-            sid = result['session_id']
-            return sessions[sid]['client'], sid
-
-    return None, None
-
-
-def run_auto_once(name='default'):
-    """One cycle: fetch Bluesky → vault → post to Facebook."""
-    key_status = ensure_zernio_keys_loaded(for_auto=True)
-    if not key_status.get('success'):
-        return {
-            "success": False,
-            "error": key_status.get('message') or "No Zernio API keys in .env",
-            "keys_checked": True,
-        }
-
-    cfg = _load_auto_config(name)
-    if not cfg:
-        return {"success": False, "error": "No auto config. Set it up first."}
-    if not cfg.get('enabled'):
-        return {"success": False, "error": "Auto pilot is disabled", "skipped": True}
-
-    source = cfg.get('source_handle')
-    if not source:
-        return {"success": False, "error": "source_handle not set"}
-
-    client, session_id = _get_bluesky_client_for_auto(cfg)
-    if not client or not session_id:
-        msg = "No Bluesky session. Login once in chat, or set bluesky_handle + app password in auto config."
-        _save_auto_config({**cfg, 'last_error': msg, 'last_run_at': datetime.now()})
-        return {"success": False, "error": msg}
-
-    try:
-        fetch = tool_fetch_posts(
-            session_id=session_id,
-            actor=source,
-            limit=max(5, int(cfg.get('max_posts_per_run') or 2) * 3),
-            include_reposts=bool(cfg.get('include_reposts')),
-            media_only=bool(cfg.get('media_only', True))
+        text = caption if caption is not None else (item.get('text') or '')
+        result = post_to_facebook(
+            image_url=image_url,
+            caption=text,
+            account_id=account_id,
+            account_username=account_username,
+            content_type=content_type or 'feed',
         )
-        if not fetch.get('success'):
-            _save_auto_config({**cfg, 'last_error': fetch.get('error'), 'last_run_at': datetime.now()})
-            return fetch
-
-        posts = fetch.get('posts') or []
-        new_posts = []
-        for p in posts:
-            uri = p.get('uri')
-            if not uri or _auto_seen(uri, name):
-                continue
-            new_posts.append(p)
-            if len(new_posts) >= int(cfg.get('max_posts_per_run') or 2):
-                break
-
-        if not new_posts:
-            result_msg = f"No new posts from @{source}"
-            _save_auto_config({**cfg, 'last_error': None, 'last_result': result_msg, 'last_run_at': datetime.now()})
-            return {"success": True, "posted_count": 0, "message": result_msg}
-
-        tool_add_to_vault(new_posts, handler_handle=source)
-
-        account_id = resolve_facebook_account_id(cfg.get('account_id'), cfg.get('account_username'))
-        if not account_id:
-            msg = f"Bad Facebook account on pipeline {name}: {cfg.get('account_id')} / {cfg.get('account_username')}"
-            _save_auto_config({**cfg, 'last_error': msg, 'last_run_at': datetime.now()})
-            return {"success": False, "error": msg}
-
-        posted = 0
-        errors = []
-        for p in new_posts:
-            r = tool_post_now(
-                uri=p.get('uri'),
-                account_id=account_id,
-                account_username=cfg.get('account_username')
-            )
-            _auto_mark_seen(p.get('uri'), posted=bool(r.get('success')), config_name=name)
-            if r.get('success'):
-                posted += 1
-            else:
-                errors.append(r.get('error') or r.get('message') or 'failed')
-            time.sleep(2)
-
-        result_msg = f"Posted {posted}/{len(new_posts)} to Facebook from @{source}"
-        if errors:
-            result_msg += f" · errors: {'; '.join(errors[:3])}"
-        _save_auto_config({
-            **cfg,
-            'last_error': None if posted else (errors[0] if errors else None),
-            'last_result': result_msg,
-            'last_run_at': datetime.now()
-        })
-        return {"success": True, "posted_count": posted, "message": result_msg, "errors": errors}
-
+        status = 'posted' if result.get('success') else 'failed'
+        _mark_posted(
+            vault_id=item.get('id'),
+            uri=item.get('uri'),
+            platform_post_id=result.get('post_id'),
+            status=status,
+            error=None if result.get('success') else (result.get('error') or result.get('message')),
+            metadata=result,
+        )
+        if result.get('success'):
+            result['message'] = f"Posted vault #{item.get('id')} to Facebook"
+            result['vault_id'] = item.get('id')
+        return result
     except Exception as e:
         traceback.print_exc()
-        _save_auto_config({**cfg, 'last_error': str(e), 'last_run_at': datetime.now()})
         return {"success": False, "error": str(e)}
 
 
-def _auto_loop():
-    print("🤖 Auto pilot loop started (Facebook destination)")
-    while not _auto_stop.is_set():
-        try:
-            configs = [c for c in _list_auto_configs() if c.get('enabled')]
-            for cfg in configs:
-                name = cfg.get('name') or 'default'
-                interval = int(cfg.get('poll_interval_sec') or 300)
-                last = cfg.get('last_run_at')
-                should_run = True
-                if last:
-                    try:
-                        if isinstance(last, str):
-                            last_dt = datetime.fromisoformat(last)
-                        else:
-                            last_dt = last
-                        if last_dt.tzinfo is None:
-                            delta = (datetime.now() - last_dt).total_seconds()
-                        else:
-                            delta = (datetime.now(last_dt.tzinfo) - last_dt).total_seconds()
-                        should_run = delta >= interval
-                    except Exception:
-                        should_run = True
-                if should_run:
-                    print(f"🤖 Auto run: {name}")
-                    run_auto_once(name)
-        except Exception as e:
-            print(f"auto loop: {e}")
-        _auto_stop.wait(30)
-
-
-def start_auto_pilot():
-    global _auto_thread
-    if _auto_thread and _auto_thread.is_alive():
-        return {"success": True, "message": "Auto pilot already running", "running": True}
-    _auto_stop.clear()
-    _auto_thread = threading.Thread(target=_auto_loop, daemon=True)
-    _auto_thread.start()
-    return {"success": True, "message": "Auto pilot started (→ Facebook)", "running": True}
-
-
-def stop_auto_pilot():
-    _auto_stop.set()
-    return {"success": True, "message": "Auto pilot stop signal sent", "running": False}
-
-
-def tool_auto_status():
-    configs = _list_auto_configs()
-    running = _auto_thread is not None and _auto_thread.is_alive() and not _auto_stop.is_set()
-    pipelines = []
-    for c in configs:
-        pipelines.append({
-            "name": c.get('name'),
-            "enabled": c.get('enabled'),
-            "source_handle": c.get('source_handle'),
-            "account_username": c.get('account_username'),
-            "account_id": c.get('account_id'),
-            "poll_interval_sec": c.get('poll_interval_sec'),
-            "max_posts_per_run": c.get('max_posts_per_run'),
-            "last_run_at": str(c.get('last_run_at')) if c.get('last_run_at') else None,
-            "last_error": c.get('last_error'),
-            "last_result": c.get('last_result'),
-        })
+def tool_post_vault_batch(count=3, account_username=None, account_id=None, content_type='feed'):
+    r = tool_list_vault_by_status(status='unposted', limit=int(count or 3))
+    items = r.get('vault') or []
+    if not items:
+        return {"success": False, "error": "No unposted vault items"}
+    posted = 0
+    errors = []
+    for it in items[: int(count or 3)]:
+        res = tool_post_now(
+            vault_id=it.get('id'),
+            account_username=account_username,
+            account_id=account_id,
+            content_type=content_type,
+        )
+        if res.get('success'):
+            posted += 1
+        else:
+            errors.append(res.get('error') or res.get('message'))
     return {
-        "success": True,
-        "running": running,
-        "pipelines": pipelines,
-        "destination": "facebook",
-        "message": f"Auto {'ON' if running else 'OFF'} · {len([p for p in pipelines if p['enabled']])} enabled · destination=Facebook"
+        "success": posted > 0,
+        "posted_count": posted,
+        "message": f"Posted {posted}/{len(items[:int(count or 3)])} to Facebook",
+        "errors": errors[:3],
     }
 
 
-def tool_auto_start():
-    # enable all configs that have source+account, or just start the loop
-    configs = _list_auto_configs()
-    for c in configs:
-        if c.get('source_handle') and (c.get('account_id') or c.get('account_username')):
-            _save_auto_config({**c, 'enabled': True})
-    return start_auto_pilot()
+def tool_post_unposted(account_username=None, limit=10):
+    return tool_post_vault_batch(count=limit, account_username=account_username)
 
 
-def tool_auto_stop():
-    configs = _list_auto_configs()
-    for c in configs:
-        _save_auto_config({**c, 'enabled': False})
-    return stop_auto_pilot()
-
-
-def tool_auto_run_now(name='default'):
-    return run_auto_once(name)
-
-
-def tool_auto_setup(name, source_handle, account_username=None, account_id=None,
-                    poll_interval_sec=300, max_posts_per_run=2, media_only=True,
-                    bluesky_handle=None, bluesky_app_password=None):
-    cfg = {
-        'name': name or 'default',
-        'enabled': True,
-        'source_handle': source_handle.lstrip('@') if source_handle else None,
-        'account_username': account_username,
-        'account_id': account_id or resolve_facebook_account_id(None, account_username),
-        'poll_interval_sec': int(poll_interval_sec or 300),
-        'max_posts_per_run': int(max_posts_per_run or 2),
-        'media_only': bool(media_only),
-        'content_type': 'feed',
-        'bluesky_handle': bluesky_handle,
-        'bluesky_app_password': bluesky_app_password,
-    }
-    ok = _save_auto_config(cfg)
-    if ok:
-        start_auto_pilot()
+def tool_list_accounts(platform='facebook'):
+    try:
+        refresh_all_zernio_accounts()
+        conn = get_db_connection()
+        if not conn:
+            return {"success": False, "error": "DB unavailable"}
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            SELECT account_id, username, display_name, platform, profile_picture, is_active
+            FROM zernio_accounts
+            WHERE platform = %s AND is_active = TRUE
+            ORDER BY username
+        """, (platform,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        accounts = []
+        for r in rows:
+            accounts.append({
+                "account_id": r['account_id'],
+                "label": r['username'] or r['display_name'],
+                "username": r['username'],
+                "display_name": r['display_name'],
+                "platform": r['platform'],
+                "profile_picture": r.get('profile_picture'),
+            })
         return {
             "success": True,
-            "message": f"Pipeline '{cfg['name']}' set: @{cfg['source_handle']} → Facebook @{account_username or account_id} every {cfg['poll_interval_sec']}s"
+            "accounts": accounts,
+            "count": len(accounts),
+            "message": f"{len(accounts)} Facebook account(s)",
         }
-    return {"success": False, "error": "Failed to save config"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
-def tool_auto_remove(name):
+def tool_get_status():
     try:
         conn = get_db_connection()
         if not conn:
             return {"success": False, "error": "DB unavailable"}
         cur = conn.cursor()
-        cur.execute("DELETE FROM auto_config WHERE name = %s", (name,))
-        cur.execute("DELETE FROM auto_seen WHERE config_name = %s", (name,))
-        conn.commit()
+        cur.execute("SELECT COUNT(*) FROM vault")
+        vault_count = cur.fetchone()[0]
+        cur.execute("""
+            SELECT COUNT(*) FROM posted_posts
+            WHERE platform = 'facebook' AND status IN ('posted', 'completed')
+        """)
+        posted_count = cur.fetchone()[0]
+        cur.execute("""
+            SELECT COUNT(*) FROM posted_posts
+            WHERE platform = 'facebook' AND status = 'scheduled'
+        """)
+        scheduled_count = cur.fetchone()[0]
+        cur.execute("""
+            SELECT COUNT(*) FROM zernio_accounts
+            WHERE platform = 'facebook' AND is_active = TRUE
+        """)
+        accounts_count = cur.fetchone()[0]
+        active_handle = None
+        if sessions:
+            active_handle = list(sessions.values())[0].get('handle')
+        else:
+            cur.execute("""
+                SELECT handle FROM sessions
+                WHERE expires_at > CURRENT_TIMESTAMP
+                ORDER BY last_used_at DESC LIMIT 1
+            """)
+            row = cur.fetchone()
+            if row:
+                active_handle = row[0]
         cur.close()
         conn.close()
-        return {"success": True, "message": f"Removed pipeline {name}"}
+        return {
+            "success": True,
+            "vault_count": vault_count,
+            "posted_count": posted_count,
+            "scheduled_count": scheduled_count,
+            "accounts_count": accounts_count,
+            "active_handle": active_handle,
+            "message": (
+                f"📊 Status:\n"
+                f"  • Vault: {vault_count}\n"
+                f"  • Posted: {posted_count}\n"
+                f"  • Scheduled: {scheduled_count}\n"
+                f"  • Facebook accounts: {accounts_count}\n"
+                f"  • Bluesky: @{active_handle}" if active_handle else
+                f"📊 Status: vault={vault_count} posted={posted_count} accounts={accounts_count}"
+            ),
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
+def tool_list_scheduled():
+    try:
+        headers = get_zernio_headers()
+        if not headers:
+            return {"success": False, "error": "No Zernio key"}
+        response = requests.get(
+            f"{ZERNIO_BASE_URL}/posts",
+            headers=headers,
+            params={"status": "scheduled", "limit": 50},
+            timeout=20,
+        )
+        if response.status_code != 200:
+            return {"success": False, "error": f"Zernio {response.status_code}"}
+        posts = response.json().get('posts') or []
+        fb = []
+        for p in posts:
+            platforms = p.get('platforms') or []
+            if any((pl.get('platform') or '').lower() == 'facebook' for pl in platforms):
+                fb.append({
+                    "id": p.get('_id'),
+                    "text": (p.get('content') or '')[:120],
+                    "scheduled_for": p.get('scheduledFor'),
+                    "status": p.get('status'),
+                })
+        return {"success": True, "scheduled": fb, "count": len(fb)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ============================================================
+# AUTO PILOT / PIPELINES
+# ============================================================
+
+_auto_thread = None
+_auto_running = False
+_auto_lock = threading.Lock()
+
+
+def tool_auto_setup(name='default', source_handle=None, account_username=None,
+                    account_id=None, poll_interval_sec=300, max_posts_per_run=2,
+                    media_only=True, include_reposts=False, enabled=False,
+                    source_handles=None, niche=None, content_type='feed'):
+    name = (name or 'default').strip()
+    sources = source_handles
+    if not sources and source_handle:
+        sources = [source_handle.strip().lstrip('@')]
+    if sources:
+        sources = [
+            (s if '.' in s else s + '.bsky.social') if isinstance(s, str) else s
+            for s in sources
+        ]
+        sources = [s.lstrip('@') for s in sources if s]
+    if not sources:
+        return {"success": False, "error": "source_handle or source_handles required"}
+
+    if not account_username and not account_id:
+        accs = tool_list_accounts('facebook')
+        alist = accs.get('accounts') or []
+        if len(alist) == 1:
+            account_username = alist[0].get('username')
+            account_id = alist[0].get('account_id')
+        elif not alist:
+            return {"success": False, "error": "No Facebook accounts. Connect one in Zernio."}
+
+    cfg = {
+        'name': name,
+        'enabled': bool(enabled),
+        'source_handle': sources[0],
+        'source_handles': sources,
+        'niche': niche or name,
+        'account_username': account_username,
+        'account_id': account_id,
+        'poll_interval_sec': int(poll_interval_sec or 300),
+        'max_posts_per_run': int(max_posts_per_run or 2),
+        'media_only': bool(media_only),
+        'include_reposts': bool(include_reposts),
+        'content_type': content_type or 'feed',
+        'last_error': None,
+        'last_result': 'configured',
+    }
+    if not _save_auto_config(cfg):
+        return {"success": False, "error": "Failed to save config"}
+    return {
+        "success": True,
+        "message": (
+            f"Pipeline '{name}' configured: "
+            f"@{' + @'.join(sources)} → Facebook @{account_username or account_id} "
+            f"(every {cfg['poll_interval_sec']}s, max {cfg['max_posts_per_run']}/run)"
+        ),
+        "config": cfg,
+    }
+
+
+def tool_auto_start(name=None):
+    global _auto_running
+    configs = _list_auto_configs()
+    if not configs:
+        return {"success": False, "error": "No pipelines. Use auto setup first."}
+    if name:
+        resolved = _resolve_pipeline_name(name)
+        if not resolved:
+            return {"success": False, "error": f"Pipeline '{name}' not found"}
+        cfg = _load_auto_config(resolved)
+        cfg['enabled'] = True
+        _save_auto_config(cfg)
+        names = [resolved]
+    else:
+        for c in configs:
+            c['enabled'] = True
+            _save_auto_config(c)
+        names = [c.get('name') for c in configs]
+
+    set_cron_state(True)
+    if not IS_VERCEL:
+        start_auto_pilot()
+    return {
+        "success": True,
+        "message": f"Started pipeline(s): {', '.join(names)}",
+        "pipelines": names,
+    }
+
+
+def tool_auto_stop(name=None):
+    global _auto_running
+    configs = _list_auto_configs()
+    if name:
+        resolved = _resolve_pipeline_name(name)
+        if not resolved:
+            return {"success": False, "error": f"Pipeline '{name}' not found"}
+        cfg = _load_auto_config(resolved)
+        cfg['enabled'] = False
+        _save_auto_config(cfg)
+        remaining = [c for c in _list_auto_configs() if c.get('enabled')]
+        if not remaining:
+            _auto_running = False
+            set_cron_state(False)
+        return {"success": True, "message": f"Stopped pipeline '{resolved}'"}
+    for c in configs:
+        c['enabled'] = False
+        _save_auto_config(c)
+    _auto_running = False
+    set_cron_state(False)
+    return {"success": True, "message": "All pipelines stopped"}
+
+
+def tool_auto_remove(name):
+    if not name:
+        return {"success": False, "error": "name required"}
+    resolved = _resolve_pipeline_name(name) or name
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return {"success": False, "error": "DB unavailable"}
+        cur = conn.cursor()
+        cur.execute("DELETE FROM auto_seen WHERE config_name = %s", (resolved,))
+        cur.execute("DELETE FROM platform_mappings WHERE config_name = %s", (resolved,))
+        cur.execute("DELETE FROM auto_config WHERE name = %s", (resolved,))
+        deleted = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+        if deleted:
+            return {"success": True, "message": f"Removed pipeline '{resolved}'"}
+        return {"success": False, "error": f"Pipeline '{name}' not found"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def tool_auto_status():
+    configs = _list_auto_configs()
+    pipelines = []
+    for c in configs:
+        pipelines.append({
+            "name": c.get('name'),
+            "enabled": bool(c.get('enabled')),
+            "source_handle": c.get('source_handle'),
+            "source_handles": c.get('source_handles') or [],
+            "account_username": c.get('account_username'),
+            "account_id": c.get('account_id'),
+            "poll_interval_sec": c.get('poll_interval_sec'),
+            "max_posts_per_run": c.get('max_posts_per_run'),
+            "last_run_at": str(c.get('last_run_at')) if c.get('last_run_at') else None,
+            "last_result": c.get('last_result'),
+            "last_error": c.get('last_error'),
+            "niche": c.get('niche'),
+        })
+    enabled = [p for p in pipelines if p['enabled']]
+    return {
+        "success": True,
+        "running": bool(_auto_running and enabled),
+        "cron_enabled": get_cron_state(),
+        "pipelines": pipelines,
+        "enabled_count": len(enabled),
+        "message": (
+            f"Auto {'ON' if (_auto_running and enabled) else 'idle'} · "
+            f"{len(enabled)}/{len(pipelines)} enabled"
+        ),
+    }
+
+
+def _seen_uri(config_name, uri):
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return False
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM auto_seen WHERE config_name = %s AND uri = %s",
+            (config_name, uri),
+        )
+        found = cur.fetchone() is not None
+        cur.close()
+        conn.close()
+        return found
+    except Exception:
+        return False
+
+
+def _mark_seen(config_name, uri, posted=False):
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO auto_seen (config_name, uri, posted)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (config_name, uri) DO UPDATE SET posted = EXCLUDED.posted
+        """, (config_name, uri, posted))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"mark seen: {e}")
+
+
+def _run_one_pipeline(cfg):
+    name = cfg.get('name') or 'default'
+    sources = cfg.get('source_handles') or []
+    if not sources and cfg.get('source_handle'):
+        sources = [cfg['source_handle']]
+    if not sources:
+        return {"success": False, "error": "No source handles"}
+
+    max_posts = int(cfg.get('max_posts_per_run') or 2)
+    media_only = bool(cfg.get('media_only', True))
+    include_reposts = bool(cfg.get('include_reposts', False))
+    account_username = cfg.get('account_username')
+    account_id = cfg.get('account_id')
+    content_type = cfg.get('content_type') or 'feed'
+
+    # Prefer unposted reserve tagged with this pipeline name
+    posted_from_reserve = 0
+    try:
+        conn = get_db_connection()
+        if conn:
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+            cur.execute("""
+                SELECT v.* FROM vault v
+                WHERE v.handler_handle = %s
+                AND NOT EXISTS (
+                    SELECT 1 FROM posted_posts p
+                    WHERE p.uri = v.uri AND p.platform = 'facebook'
+                      AND p.status IN ('completed', 'posted')
+                )
+                ORDER BY v.saved_at ASC
+                LIMIT %s
+            """, (name, max_posts))
+            reserve = cur.fetchall()
+            cur.close()
+            conn.close()
+            for item in reserve:
+                res = tool_post_now(
+                    vault_id=item['id'],
+                    account_username=account_username,
+                    account_id=account_id,
+                    content_type=content_type,
+                )
+                if res.get('success'):
+                    posted_from_reserve += 1
+                    _mark_seen(name, item.get('uri'), posted=True)
+    except Exception as e:
+        print(f"reserve post: {e}")
+
+    if posted_from_reserve >= max_posts:
+        msg = f"Posted {posted_from_reserve} from reserve"
+        cfg['last_result'] = msg
+        cfg['last_error'] = None
+        cfg['last_run_at'] = datetime.now()
+        _save_auto_config(cfg)
+        return {"success": True, "posted": posted_from_reserve, "message": msg}
+
+    remaining = max_posts - posted_from_reserve
+    client, _meta = _get_any_bluesky_client()
+    if not client:
+        msg = f"Posted {posted_from_reserve} from reserve; no Bluesky session for fetch"
+        cfg['last_result'] = msg
+        cfg['last_error'] = "No Bluesky session"
+        cfg['last_run_at'] = datetime.now()
+        _save_auto_config(cfg)
+        return {"success": posted_from_reserve > 0, "posted": posted_from_reserve, "message": msg}
+
+    fetched_posts = []
+    for src in sources:
+        try:
+            actor = src.lstrip('@')
+            if '.' not in actor:
+                actor = actor + '.bsky.social'
+            feed = client.get_author_feed(actor=actor, limit=20)
+            for item in feed.feed:
+                if not include_reposts and getattr(item, 'reason', None) is not None:
+                    continue
+                post = item.post
+                uri = post.uri
+                if _seen_uri(name, uri):
+                    continue
+                images = []
+                view_embed = getattr(post, 'embed', None)
+                if view_embed:
+                    imgs = getattr(view_embed, 'images', None)
+                    if imgs:
+                        for im in imgs:
+                            url = getattr(im, 'fullsize', None) or getattr(im, 'thumb', None)
+                            if url:
+                                images.append({"url": url, "thumb": getattr(im, 'thumb', url)})
+                    media = getattr(view_embed, 'media', None)
+                    if media and hasattr(media, 'images'):
+                        for im in media.images:
+                            url = getattr(im, 'fullsize', None) or getattr(im, 'thumb', None)
+                            if url:
+                                images.append({"url": url, "thumb": getattr(im, 'thumb', url)})
+                if media_only and not images:
+                    continue
+                record = post.record
+                fetched_posts.append({
+                    "uri": uri,
+                    "author": post.author.handle if post.author else actor,
+                    "display_name": getattr(post.author, 'display_name', None),
+                    "text": getattr(record, 'text', '') or '',
+                    "images": images,
+                    "likes": getattr(post, 'like_count', 0) or 0,
+                    "reposts": getattr(post, 'repost_count', 0) or 0,
+                    "replies": getattr(post, 'reply_count', 0) or 0,
+                    "created_at": getattr(record, 'created_at', None),
+                })
+        except Exception as e:
+            print(f"fetch {src}: {e}")
+
+    if fetched_posts:
+        tool_add_to_vault(fetched_posts, handler_handle=name)
+
+    posted_new = 0
+    for p in fetched_posts[:remaining]:
+        _mark_seen(name, p['uri'], posted=False)
+        # find vault id
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM vault WHERE uri = %s", (p['uri'],))
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+            vid = row[0] if row else None
+        except Exception:
+            vid = None
+        if vid:
+            res = tool_post_now(
+                vault_id=vid,
+                account_username=account_username,
+                account_id=account_id,
+                content_type=content_type,
+            )
+            if res.get('success'):
+                posted_new += 1
+                _mark_seen(name, p['uri'], posted=True)
+
+    total = posted_from_reserve + posted_new
+    msg = f"Posted {total} (reserve={posted_from_reserve}, new={posted_new})"
+    cfg['last_result'] = msg
+    cfg['last_error'] = None
+    cfg['last_run_at'] = datetime.now()
+    _save_auto_config(cfg)
+    return {"success": True, "posted": total, "message": msg}
+
+
+def tool_auto_run_now(name=None):
+    if not get_cron_state() and name is None:
+        # still allow explicit named runs
+        pass
+    results = []
+    if name:
+        resolved = _resolve_pipeline_name(name) or name
+        cfg = _load_auto_config(resolved)
+        if not cfg:
+            return {"success": False, "error": f"Pipeline '{name}' not found"}
+        r = _run_one_pipeline(cfg)
+        results.append({"name": resolved, **r})
+    else:
+        for cfg in _list_auto_configs():
+            if not cfg.get('enabled'):
+                continue
+            r = _run_one_pipeline(cfg)
+            results.append({"name": cfg.get('name'), **r})
+    total_posted = sum(r.get('posted', 0) for r in results if r.get('success'))
+    return {
+        "success": True,
+        "results": results,
+        "posted_count": total_posted,
+        "message": f"Ran {len(results)} pipeline(s), posted {total_posted}",
+    }
+
+
+def _auto_loop():
+    global _auto_running
+    print("🤖 Auto pilot loop started (Facebook)")
+    while _auto_running:
+        try:
+            if not get_cron_state():
+                time.sleep(15)
+                continue
+            configs = [c for c in _list_auto_configs() if c.get('enabled')]
+            if not configs:
+                time.sleep(20)
+                continue
+            min_interval = min(int(c.get('poll_interval_sec') or 300) for c in configs)
+            for cfg in configs:
+                try:
+                    _run_one_pipeline(cfg)
+                except Exception as e:
+                    print(f"Pipeline {cfg.get('name')} error: {e}")
+                    cfg['last_error'] = str(e)
+                    _save_auto_config(cfg)
+            time.sleep(max(60, min_interval))
+        except Exception as e:
+            print(f"Auto loop error: {e}")
+            time.sleep(30)
+    print("🤖 Auto pilot loop stopped")
+
+
+def start_auto_pilot():
+    global _auto_thread, _auto_running
+    with _auto_lock:
+        if IS_VERCEL:
+            return {"success": False, "message": "Background pilot disabled on Vercel; use cron endpoint"}
+        if _auto_running and _auto_thread and _auto_thread.is_alive():
+            return {"success": True, "message": "Already running"}
+        _auto_running = True
+        _auto_thread = threading.Thread(target=_auto_loop, daemon=True)
+        _auto_thread.start()
+        return {"success": True, "message": "Auto pilot started"}
+
+
+# ============================================================
+# MASTER FETCH (reserve)
+# ============================================================
+
+def tool_master_fetch_niche(name=None, limit_per_source=20):
+    if not name:
+        return {"success": False, "error": "name required"}
+    cfg = _load_auto_config(name)
+    if not cfg:
+        return {"success": False, "error": f"Pipeline '{name}' not found"}
+    sources = cfg.get('source_handles') or []
+    if not sources and cfg.get('source_handle'):
+        sources = [cfg['source_handle']]
+    if not sources:
+        return {"success": False, "error": "No source handles on this pipeline"}
+
+    client, _ = _get_any_bluesky_client()
+    if not client:
+        return {"success": False, "error": "No Bluesky session / master account"}
+
+    all_posts = []
+    for src in sources:
+        actor = src.lstrip('@')
+        if '.' not in actor:
+            actor = actor + '.bsky.social'
+        try:
+            feed = client.get_author_feed(actor=actor, limit=int(limit_per_source or 20))
+            for item in feed.feed:
+                post = item.post
+                images = []
+                view_embed = getattr(post, 'embed', None)
+                if view_embed:
+                    imgs = getattr(view_embed, 'images', None)
+                    if imgs:
+                        for im in imgs:
+                            url = getattr(im, 'fullsize', None) or getattr(im, 'thumb', None)
+                            if url:
+                                images.append({"url": url, "thumb": getattr(im, 'thumb', url)})
+                if cfg.get('media_only', True) and not images:
+                    continue
+                record = post.record
+                all_posts.append({
+                    "uri": post.uri,
+                    "author": post.author.handle if post.author else actor,
+                    "display_name": getattr(post.author, 'display_name', None),
+                    "text": getattr(record, 'text', '') or '',
+                    "images": images,
+                    "likes": getattr(post, 'like_count', 0) or 0,
+                    "reposts": getattr(post, 'repost_count', 0) or 0,
+                    "replies": getattr(post, 'reply_count', 0) or 0,
+                    "created_at": getattr(record, 'created_at', None),
+                })
+        except Exception as e:
+            print(f"master fetch {src}: {e}")
+
+    result = tool_add_to_vault(all_posts, handler_handle=name)
+    return {
+        "success": True,
+        "saved": result.get('saved', 0),
+        "skipped": result.get('skipped', 0),
+        "message": f"Reserve for '{name}': saved {result.get('saved', 0)} (skipped {result.get('skipped', 0)})",
+    }
+
+
+def tool_master_fetch_all_niches(limit_per_source=20):
+    configs = _list_auto_configs()
+    if not configs:
+        return {"success": False, "error": "No pipelines configured"}
+    total_saved = 0
+    parts = []
+    for c in configs:
+        r = tool_master_fetch_niche(name=c.get('name'), limit_per_source=limit_per_source)
+        if r.get('success'):
+            total_saved += int(r.get('saved') or 0)
+            parts.append(f"{c.get('name')}: +{r.get('saved', 0)}")
+        else:
+            parts.append(f"{c.get('name')}: {r.get('error')}")
+    return {
+        "success": True,
+        "saved": total_saved,
+        "message": f"All niches: saved {total_saved}. " + "; ".join(parts),
+    }
+
+
+def tool_add_source_to_niche(niche, source):
+    configs = _list_auto_configs()
+    target = None
+    for c in configs:
+        if (c.get('name') or '').lower() == niche.lower() or (c.get('niche') or '').lower() == niche.lower():
+            target = c
+            break
+    if not target:
+        return {"success": False, "error": f"Niche/pipeline '{niche}' not found"}
+    source = source.strip().lstrip('@')
+    if '.' not in source:
+        source = source + '.bsky.social'
+    handles = list(target.get('source_handles') or [])
+    if source not in handles:
+        handles.append(source)
+    target['source_handles'] = handles
+    target['source_handle'] = handles[0]
+    _save_auto_config(target)
+    return {"success": True, "message": f"Added @{source} to {target.get('name')}"}
+
+
+def tool_remove_source_from_niche(niche, source):
+    configs = _list_auto_configs()
+    target = None
+    for c in configs:
+        if (c.get('name') or '').lower() == niche.lower() or (c.get('niche') or '').lower() == niche.lower():
+            target = c
+            break
+    if not target:
+        return {"success": False, "error": f"Niche '{niche}' not found"}
+    source = source.strip().lstrip('@')
+    handles = [h for h in (target.get('source_handles') or []) if h.lstrip('@') != source and h != source + '.bsky.social']
+    target['source_handles'] = handles
+    target['source_handle'] = handles[0] if handles else None
+    _save_auto_config(target)
+    return {"success": True, "message": f"Removed source from {target.get('name')}"}
+
+
+def tool_list_niche_sources(niche):
+    configs = _list_auto_configs()
+    for c in configs:
+        if (c.get('name') or '').lower() == niche.lower() or (c.get('niche') or '').lower() == niche.lower():
+            srcs = c.get('source_handles') or []
+            return {
+                "success": True,
+                "sources": srcs,
+                "message": f"{c.get('name')}: " + (", ".join(f"@{s}" for s in srcs) or "none"),
+            }
+    return {"success": False, "error": f"Niche '{niche}' not found"}
+
+
+def tool_list_all_niches():
+    configs = _list_auto_configs()
+    lines = []
+    for c in configs:
+        srcs = c.get('source_handles') or []
+        lines.append(
+            f"• {c.get('name')}: {'🟢' if c.get('enabled') else '🔴'} "
+            f"{len(srcs)} source(s) → @{c.get('account_username') or '?'}"
+        )
+    return {
+        "success": True,
+        "niches": configs,
+        "message": "Niches:\n" + ("\n".join(lines) if lines else "None"),
+    }
+
+
+# ============================================================
+# TOOLS SCHEMA + EXECUTE
+# ============================================================
 
 TOOLS_SCHEMA = [
     {
@@ -2494,11 +2492,11 @@ TOOLS_SCHEMA = [
                 "type": "object",
                 "properties": {
                     "username": {"type": "string"},
-                    "password": {"type": "string"}
+                    "password": {"type": "string"},
                 },
-                "required": ["username", "password"]
-            }
-        }
+                "required": ["username", "password"],
+            },
+        },
     },
     {
         "type": "function",
@@ -2509,360 +2507,317 @@ TOOLS_SCHEMA = [
                 "type": "object",
                 "properties": {
                     "actor": {"type": "string"},
-                    "limit": {"type": "integer"},
-                    "media_only": {"type": "boolean"},
-                    "include_reposts": {"type": "boolean"}
+                    "limit": {"type": "integer", "default": 15},
+                    "media_only": {"type": "boolean", "default": True},
+                    "include_reposts": {"type": "boolean", "default": False},
                 },
-                "required": ["actor"]
-            }
-        }
+                "required": ["actor"],
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "add_to_vault",
-            "description": "Save recently fetched posts to vault",
-            "parameters": {"type": "object", "properties": {}}
-        }
+            "description": "Save last fetched posts to vault",
+            "parameters": {"type": "object", "properties": {}},
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "list_vault",
-            "description": "List items in the vault",
+            "description": "List vault items",
             "parameters": {
                 "type": "object",
-                "properties": {"limit": {"type": "integer"}}
-            }
-        }
+                "properties": {"limit": {"type": "integer", "default": 15}},
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "list_vault_by_status",
-            "description": "List vault items filtered by post status. Use 'unposted' for items not yet posted, 'posted' for already posted, 'scheduled' for scheduled, or 'all' for everything.",
+            "description": "List vault by status: unposted, posted, scheduled, all",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "status": {
-                        "type": "string",
-                        "enum": ["unposted", "posted", "scheduled", "all"],
-                        "description": "Filter by post status"
-                    },
-                    "limit": {"type": "integer", "default": 50}
-                }
-            }
-        }
+                    "status": {"type": "string", "enum": ["unposted", "posted", "scheduled", "all"]},
+                    "limit": {"type": "integer", "default": 50},
+                },
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "delete_vault_items",
-            "description": "PERMANENTLY delete vault items by status or all. Use with caution! This cannot be undone. ALWAYS confirm with the user before deleting.",
+            "description": "Delete vault items by ids, status, or all (confirm YES_DELETE_ALL)",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "status": {
-                        "type": "string",
-                        "enum": ["unposted", "posted", "scheduled", "all"],
-                        "description": "Delete items by status"
-                    },
-                    "ids": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "List of vault IDs to delete"
-                    },
-                    "all": {
-                        "type": "boolean",
-                        "description": "Delete ALL vault items (requires confirmation)"
-                    }
-                }
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "post_unposted",
-            "description": "Post all unposted vault items to Facebook immediately",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "account_username": {
-                        "type": "string",
-                        "description": "Facebook account username to post to"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "default": 10,
-                        "description": "Max number of items to post"
-                    }
-                }
-            }
-        }
+                    "status": {"type": "string"},
+                    "ids": {"type": "array", "items": {"type": "integer"}},
+                    "all": {"type": "boolean"},
+                    "confirm": {"type": "string"},
+                },
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "post_now",
-            "description": "Post a vault item to Facebook now by vault_id or uri",
+            "description": "Post a vault item to Facebook now",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "vault_id": {"type": "integer"},
                     "uri": {"type": "string"},
                     "caption": {"type": "string"},
-                    "account_username": {"type": "string"}
-                }
-            }
-        }
+                    "account_username": {"type": "string"},
+                },
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "post_vault_batch",
-            "description": "Post multiple vault items to Facebook now",
+            "description": "Post multiple unposted vault items to Facebook",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "count": {"type": "integer", "default": 3},
-                    "account_username": {"type": "string"}
-                }
-            }
-        }
+                    "account_username": {"type": "string"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "post_unposted",
+            "description": "Post all unposted vault items to Facebook",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "account_username": {"type": "string"},
+                    "limit": {"type": "integer", "default": 10},
+                },
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "list_accounts",
             "description": "List connected Facebook accounts",
-            "parameters": {"type": "object", "properties": {}}
-        }
+            "parameters": {"type": "object", "properties": {}},
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "get_status",
-            "description": "Get vault / posted / accounts status",
-            "parameters": {"type": "object", "properties": {}}
-        }
+            "description": "Vault / posted / accounts status",
+            "parameters": {"type": "object", "properties": {}},
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "list_scheduled",
             "description": "List scheduled Facebook posts",
-            "parameters": {"type": "object", "properties": {}}
-        }
+            "parameters": {"type": "object", "properties": {}},
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "auto_setup",
-            "description": "Configure auto pipeline: watch Bluesky handle → post to Facebook account",
+            "description": "Configure auto pipeline: Bluesky source(s) → Facebook account",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string"},
                     "source_handle": {"type": "string"},
+                    "source_handles": {"type": "array", "items": {"type": "string"}},
                     "account_username": {"type": "string"},
                     "poll_interval_sec": {"type": "integer"},
-                    "max_posts_per_run": {"type": "integer"}
+                    "max_posts_per_run": {"type": "integer"},
+                    "enabled": {"type": "boolean"},
                 },
-                "required": ["source_handle"]
-            }
-        }
+                "required": ["source_handle"],
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "auto_start",
-            "description": "Start auto pilot",
-            "parameters": {"type": "object", "properties": {}}
-        }
+            "description": "Start auto pilot (optional pipeline name)",
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "auto_stop",
-            "description": "Stop auto pilot",
-            "parameters": {"type": "object", "properties": {}}
-        }
+            "description": "Stop auto pilot (optional pipeline name)",
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "auto_status",
-            "description": "Auto pilot status",
-            "parameters": {"type": "object", "properties": {}}
-        }
+            "description": "Auto pilot status and pipelines",
+            "parameters": {"type": "object", "properties": {}},
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "auto_run_now",
-            "description": "Run one auto cycle immediately",
+            "description": "Run one auto cycle now",
             "parameters": {
                 "type": "object",
-                "properties": {"name": {"type": "string"}}
-            }
-        }
+                "properties": {"name": {"type": "string"}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "auto_remove",
+            "description": "Delete a pipeline by name",
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "check_zernio_key",
-            "description": "Validate a Zernio API key and list Facebook accounts",
+            "description": "Validate Zernio API key and list Facebook accounts",
             "parameters": {
                 "type": "object",
                 "properties": {"api_key": {"type": "string"}},
-                "required": ["api_key"]
-            }
-        }
+                "required": ["api_key"],
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "list_api_keys",
-            "description": "List all configured Zernio API keys from .env",
-            "parameters": {"type": "object", "properties": {}}
-        }
+            "description": "List configured Zernio API keys",
+            "parameters": {"type": "object", "properties": {}},
+        },
     },
 ]
-TOOL_MAP = {
-    "login": tool_login,
-    "fetch_posts": tool_fetch_posts,
-    "add_to_vault": tool_add_to_vault,
-    "list_vault": tool_list_vault,
-    "list_vault_by_status": tool_list_vault_by_status,
-    "delete_vault_items": tool_delete_vault_items,
-    "post_unposted": tool_post_unposted,
-    "post_now": tool_post_now,
-    "post_vault_batch": tool_post_vault_batch,
-    "list_accounts": tool_list_accounts,
-    "get_status": tool_get_status,
-    "list_scheduled": tool_list_scheduled,
-    "auto_setup": tool_auto_setup,
-    "auto_start": tool_auto_start,
-    "auto_stop": tool_auto_stop,
-    "auto_status": tool_auto_status,
-    "auto_run_now": tool_auto_run_now,
-    "auto_remove": tool_auto_remove,
-    "check_zernio_key": tool_check_zernio_key,
-    "list_api_keys": tool_list_api_keys,
-}
+
+
 def execute_tool(name, args, session_id=None):
     args = args or {}
     try:
         if name == 'login':
             return tool_login(args.get('username'), args.get('password'))
-        
         if name == 'fetch_posts':
-            if not session_id:
-                return {"success": False, "error": "Login first"}
             return tool_fetch_posts(
                 session_id,
                 args.get('actor'),
                 limit=int(args.get('limit') or 15),
                 media_only=bool(args.get('media_only', True)),
-                include_reposts=bool(args.get('include_reposts', False))
+                include_reposts=bool(args.get('include_reposts', False)),
             )
-        
         if name == 'add_to_vault':
             posts = []
             if session_id and session_id in sessions:
                 posts = sessions[session_id].get('_last_fetched') or []
-            return tool_add_to_vault(posts, handler_handle=sessions.get(session_id, {}).get('_last_actor'))
-        
+            return tool_add_to_vault(
+                posts,
+                handler_handle=sessions.get(session_id, {}).get('_last_actor'),
+            )
         if name == 'list_vault':
             return tool_list_vault(limit=int(args.get('limit') or 15))
-        
-        # ===== NEW VAULT MANAGEMENT TOOLS =====
         if name == 'list_vault_by_status':
             return tool_list_vault_by_status(
                 status=args.get('status', 'all'),
-                limit=int(args.get('limit', 50))
+                limit=int(args.get('limit', 50)),
             )
-        
         if name == 'delete_vault_items':
-            # Require confirmation for "delete all"
-            if args.get('all'):
-                confirm = args.get('confirm')
-                if confirm != 'YES_DELETE_ALL':
-                    return {
-                        "success": False, 
-                        "error": "Confirmation required",
-                        "message": "⚠️ This will permanently delete ALL vault items. Reply with 'YES_DELETE_ALL' to confirm."
-                    }
+            if args.get('all') and args.get('confirm') != 'YES_DELETE_ALL':
+                return {
+                    "success": False,
+                    "error": "Confirmation required",
+                    "message": "⚠️ Reply with confirm YES_DELETE_ALL to wipe vault.",
+                }
             return tool_delete_vault_items(
                 ids=args.get('ids'),
                 status=args.get('status'),
-                all=args.get('all', False)
+                all=args.get('all', False),
             )
-        
-        if name == 'post_unposted':
-            return tool_post_unposted(
-                account_username=args.get('account_username'),
-                limit=int(args.get('limit', 10))
-            )
-        
-        if name == 'post_vault_batch':
-            return tool_post_vault_batch(
-                count=args.get('count', 3),
-                account_username=args.get('account_username'),
-                account_id=args.get('account_id')
-            )
-        # ===== END NEW TOOLS =====
-        
         if name == 'post_now':
             return tool_post_now(
                 vault_id=args.get('vault_id'),
                 uri=args.get('uri'),
                 caption=args.get('caption'),
                 account_username=args.get('account_username'),
-                account_id=args.get('account_id')
+                account_id=args.get('account_id'),
             )
-        
+        if name == 'post_vault_batch':
+            return tool_post_vault_batch(
+                count=args.get('count', 3),
+                account_username=args.get('account_username'),
+                account_id=args.get('account_id'),
+            )
+        if name == 'post_unposted':
+            return tool_post_unposted(
+                account_username=args.get('account_username'),
+                limit=int(args.get('limit', 10)),
+            )
         if name == 'list_accounts':
             return tool_list_accounts('facebook')
-        
         if name == 'get_status':
             return tool_get_status()
-        
         if name == 'list_scheduled':
             return tool_list_scheduled()
-        
         if name == 'auto_setup':
             return tool_auto_setup(
                 name=args.get('name') or 'default',
                 source_handle=args.get('source_handle'),
+                source_handles=args.get('source_handles'),
                 account_username=args.get('account_username'),
                 account_id=args.get('account_id'),
                 poll_interval_sec=args.get('poll_interval_sec') or 300,
                 max_posts_per_run=args.get('max_posts_per_run') or 2,
+                enabled=bool(args.get('enabled', False)),
             )
-        
         if name == 'auto_start':
-            return tool_auto_start()
-        
+            return tool_auto_start(args.get('name'))
         if name == 'auto_stop':
-            return tool_auto_stop()
-        
+            return tool_auto_stop(args.get('name'))
         if name == 'auto_status':
             return tool_auto_status()
-        
         if name == 'auto_run_now':
-            return tool_auto_run_now(args.get('name') or 'default')
-        
+            return tool_auto_run_now(args.get('name'))
         if name == 'auto_remove':
             return tool_auto_remove(args.get('name'))
-        
         if name == 'check_zernio_key':
             return tool_check_zernio_key(args.get('api_key'))
-        
         if name == 'list_api_keys':
             return tool_list_api_keys()
-        
         return {"success": False, "error": f"Unknown tool {name}"}
     except Exception as e:
         traceback.print_exc()
@@ -2871,113 +2826,31 @@ def execute_tool(name, args, session_id=None):
 
 SYSTEM_PROMPT = """You are the AI for Bluesky AI Vault → Facebook.
 
-VAULT MANAGEMENT COMMANDS:
-- "list unposted" or "show unposted" → Call list_vault_by_status(status="unposted")
-- "list posted" or "show posted" → Call list_vault_by_status(status="posted")  
-- "list scheduled" or "show scheduled" → Call list_vault_by_status(status="scheduled")
-- "list all vault" or "show all vault" → Call list_vault_by_status(status="all")
-- "post unposted" → Call post_unposted()
-- "post count 5" → Call post_unposted(limit=5)
-- "delete unposted" → Call delete_vault_items(status="unposted")
-- "delete posted" → Call delete_vault_items(status="posted")
-- "delete scheduled" → Call delete_vault_items(status="scheduled")
-- "delete all vault" → Call delete_vault_items(all=True) (⚠️ Requires confirmation: "YES_DELETE_ALL")
-- "delete vault id 1,2,3" → Call delete_vault_items(ids=[1,2,3])
-- "post id 5" → Call post_now(vault_id=5)
-- "post 3 from vault" → Call post_vault_batch(count=3)
+Source: Bluesky. Destination: Facebook only (via Zernio). Never mention Instagram or other networks.
 
-===========================================
-CRITICAL - MULTIPLE ACCOUNTS FLOW:
-===========================================
-When the user wants to POST something (post_now, post_unposted, post_vault_batch):
-
-STEP 1: Check if the user specified an account:
-- "post id 5 to ScorpioGuardian" → use account_username="ScorpioGuardian"
-- "post unposted to Daily Wisdom" → use account_username="Daily Wisdom"
-
-STEP 2: If NO account was specified:
-- Call list_accounts() first to check how many accounts exist
-- If ONLY 1 account → use it automatically, mention: "Posting to [account_name]"
-- If MULTIPLE accounts → ASK the user: "You have [N] Facebook accounts: [list names]. Which account would you like to post to?"
-
-STEP 3: Wait for the user's response before posting.
-
-ACCOUNT MANAGEMENT:
-- "list accounts" or "how many accounts" → Call list_accounts()
-- "which account" or "what accounts" → Call list_accounts()
-
-===========================================
-CRITICAL - When responding to vault questions:
-===========================================
-1. Call the appropriate tool first
-2. Use the tool result to respond with a friendly summary
-3. Show count, status, and list items with their IDs
-4. For deletion, ALWAYS confirm with the user first (especially for "delete all")
-5. When showing vault items, include their status icons:
-   ✅ = posted, ⏳ = scheduled, ⬜ = unposted
-6. For posting, always mention which account was used (e.g., "Posted to ScorpioGuardian")
-
-RULES:
-- Source platform: Bluesky (login, fetch posts).
-- Destination platform: Facebook only (post, schedule, auto-pilot via Zernio).
-- Only talk about Bluesky and Facebook. Do not name any other social networks.
-- Connected publishing accounts are Facebook accounts only.
-
-You help the user:
-- Login to Bluesky
-- Fetch posts from Bluesky handles
-- Save them to a vault
+You can:
+- Login to Bluesky, fetch posts, save to vault
 - Post vault items to Facebook (ask which account if multiple)
-- Auto-pilot: watch a Bluesky account and cross-post new media to Facebook
-- Manage vault: list by status, delete items, post unposted items
+- Auto pipelines: named configs watching Bluesky → Facebook
+- list pipelines / start pipeline NAME / stop pipeline NAME / auto status
+- Master-fetch fills a pipeline's vault reserve
 
-Be concise. Timezone for schedules is Africa/Nairobi (GMT+3).
+Be concise. Timezone for schedules: Africa/Nairobi (GMT+3).
 """
 
 
 def format_tool_summary(tool_results):
-    """Human-readable summary with proper vault formatting."""
     parts = []
     for tr in tool_results:
         name = tr.get('name')
         r = tr.get('result') or {}
-        
         if not r.get('success'):
             parts.append(f"❌ {name}: {r.get('error') or r.get('message') or 'failed'}")
             continue
-        
-        # Handle list_vault specifically
-        if name == 'list_vault':
-            items = r.get('vault') or []
-            count = r.get('count') or len(items)
-            
-            if count == 0:
-                parts.append("📦 Your vault is empty right now.")
-            else:
-                lines = [f"📦 Vault has **{count}** post(s):"]
-                for i, item in enumerate(items[:5], 1):
-                    text = (item.get('text') or '').strip()
-                    if len(text) > 70:
-                        text = text[:70] + "..."
-                    if not text:
-                        text = "(image only)"
-                    img_count = len(item.get('images') or [])
-                    img_text = f" 📸{img_count}" if img_count > 0 else ""
-                    author = f" @{item.get('author', '?')}"
-                    lines.append(f"  {i}. {text}{img_text}{author}")
-                
-                if len(items) > 5:
-                    lines.append(f"  ...and {len(items) - 5} more")
-                
-                parts.append("\n".join(lines))
-            continue
-        
-        # Handle other tools
         if r.get('message'):
             parts.append(r['message'])
-            continue
-        parts.append(f"{name}: OK")
-    
+        else:
+            parts.append(f"✅ {name} completed")
     return "\n".join(parts) if parts else "Done."
 
 
@@ -2985,40 +2858,27 @@ def simple_fallback(msg, session_id):
     lower = msg.lower().strip()
 
     if lower.startswith('login ') or 'login with' in lower:
-        m = re.search(r'login(?:\s+with)?\s+([^\s]+)\s+(?:and\s+)?(.+)', msg.strip(), re.IGNORECASE)
+        m = re.search(r'login(?:\s+with)?\s+([^\s]+)\s+(?:and\s+)?(.+)', msg.strip(), re.I)
         if m:
-            username = m.group(1).strip().rstrip(',')
-            password = m.group(2).strip().rstrip('.,!')
-            result = tool_login(username, password)
+            result = tool_login(m.group(1).strip().rstrip(','), m.group(2).strip().rstrip('.,!'))
             if result.get('success'):
                 return f"✅ {result.get('message')}\nSession ID: {result.get('session_id')}"
             return f"❌ Login failed: {result.get('error')}"
         return "Format: Login with <handle> and <app-password>"
 
-    if 'restore' in lower and ('session' in lower or '@' in lower or '.bsky' in lower):
-        m = re.search(r'@?([a-zA-Z0-9._-]+\.bsky\.social|[a-zA-Z0-9._-]+)', msg)
-        if m:
-            result = tool_restore_session(m.group(1))
-            return result.get('message') or result.get('error') or str(result)
-
     sk = re.search(r'(sk_[A-Za-z0-9]{20,})', msg)
     if sk:
-        return tool_check_zernio_key(api_key=sk.group(1)).get('message') or str(
-            tool_check_zernio_key(api_key=sk.group(1))
-        )
+        return tool_check_zernio_key(api_key=sk.group(1)).get('message')
 
-    if any(w in lower for w in ('api key', 'api keys', 'zernio key', 'zernio keys', 'how many key')):
-        r = tool_list_api_keys()
-        return r.get('message') or str(r)
+    if any(w in lower for w in ('api key', 'api keys', 'zernio key', 'zernio keys')):
+        return tool_list_api_keys().get('message') or str(tool_list_api_keys())
 
-    if any(w in lower for w in ('status', 'how many', "what's in", 'counts')):
+    if any(w in lower for w in ('status', 'how many', "what's in", 'counts')) and 'auto' not in lower and 'cron' not in lower:
         r = tool_get_status()
-        return r.get('message', str(r)) if r.get('success') else str(r)
+        return r.get('message', str(r))
 
     if 'vault' in lower and any(w in lower for w in ('list', 'show', 'what')):
         r = tool_list_vault(limit=10)
-        if not r.get('success'):
-            return r.get('error', str(r))
         items = r.get('vault') or []
         if not items:
             return "Vault is empty."
@@ -3027,35 +2887,66 @@ def simple_fallback(msg, session_id):
             lines.append(f"{i}. id={it.get('id')} @{it.get('author')}: {(it.get('text') or '')[:80]}")
         return "\n".join(lines)
 
-    if 'scheduled' in lower:
-        r = tool_list_scheduled()
-        if not r.get('success'):
-            return r.get('error', str(r))
-        items = r.get('scheduled') or []
-        if not items:
-            return "No scheduled Facebook posts."
-        lines = [f"Scheduled ({r.get('count')}):"]
-        for it in items:
-            lines.append(f"• {it.get('scheduled_for')} — {(it.get('text') or '')[:60]}")
-        return "\n".join(lines)
-
     if 'account' in lower and 'api' not in lower:
         r = tool_list_accounts('facebook')
-        if not r.get('success'):
-            return r.get('error', str(r))
         accs = r.get('accounts') or []
         if not accs:
-            return "No connected Facebook accounts. Connect one in Zernio and set ZERNIO_API_KEY."
-        return "Facebook accounts:\n" + "\n".join(
-            f"• @{a.get('label')} ({a.get('account_id')})" for a in accs
-        )
+            return "No Facebook accounts. Connect one in Zernio."
+        return "Facebook accounts:\n" + "\n".join(f"• @{a.get('label')}" for a in accs)
+
+    if any(w in lower for w in ('list pipelines', 'show pipelines', 'pipelines')):
+        configs = _list_auto_configs()
+        if not configs:
+            return "No pipelines configured."
+        lines = ["📋 Pipelines:"]
+        for c in configs:
+            status = "🟢" if c.get('enabled') else "🔴"
+            lines.append(
+                f"  {status} {c.get('name')}: @{c.get('source_handle')} → @{c.get('account_username')} · {c.get('last_result') or 'never'}"
+            )
+        return "\n".join(lines)
+
+    if any(w in lower for w in ('auto status', 'pipeline status', 'status all')):
+        return tool_auto_status().get('message', str(tool_auto_status()))
+
+    if any(w in lower for w in ('cron status', 'is cron')):
+        on = get_cron_state()
+        return f"Cron: {'🟢 ENABLED' if on else '🔴 DISABLED'}"
+
+    if any(w in lower for w in ('start pipeline', 'enable pipeline')):
+        m = re.search(r'(?:pipeline\s+)?([a-zA-Z0-9._-]+)', msg)
+        name = m.group(1) if m else None
+        if name and name.lower() not in ('pipeline', 'start', 'enable'):
+            return tool_auto_start(name=name).get('message')
+        return "Say: start pipeline <name>"
+
+    if any(w in lower for w in ('stop pipeline', 'disable pipeline')):
+        m = re.search(r'(?:pipeline\s+)?([a-zA-Z0-9._-]+)', msg)
+        name = m.group(1) if m else None
+        if name and name.lower() not in ('pipeline', 'stop', 'disable'):
+            return tool_auto_stop(name=name).get('message')
+        return "Say: stop pipeline <name>"
+
+    if any(w in lower for w in ('run pipeline', 'run auto', 'auto run')):
+        m = re.search(r'(?:pipeline\s+)?([a-zA-Z0-9._-]+)', msg)
+        name = m.group(1) if m and m.group(1).lower() not in ('pipeline', 'run', 'auto', 'now') else None
+        return tool_auto_run_now(name=name).get('message', str(tool_auto_run_now(name=name)))
+
+    if any(w in lower for w in ('remove pipeline', 'delete pipeline')):
+        m = re.search(r'(?:remove|delete)\s+(?:pipeline|auto)\s+([a-zA-Z0-9._-]+)', msg, re.I)
+        if m:
+            return tool_auto_remove(m.group(1)).get('message')
+        return "Say: Remove pipeline <name>"
+
+    if any(w in lower for w in ('stop auto', 'auto stop')):
+        return tool_auto_stop().get('message')
+    if any(w in lower for w in ('start auto', 'auto start', 'go autonomous')):
+        return tool_auto_start().get('message')
 
     if 'fetch' in lower:
         m = re.search(r'@?([a-zA-Z0-9._-]+\.bsky\.social|[a-zA-Z0-9._-]+)', msg)
         limit_m = re.search(r'(\d+)\s*posts?', lower)
         limit = int(limit_m.group(1)) if limit_m else 15
-        if not session_id:
-            return "Not logged in. Say: Login with <handle> and <app-password>"
         if not m:
             return "Say: Fetch 15 posts from @handle"
         actor = m.group(1)
@@ -3065,125 +2956,83 @@ def simple_fallback(msg, session_id):
         if not r.get('success'):
             return f"❌ {r.get('error')}"
         posts = r.get('posts') or []
-        lines = [f"Fetched {len(posts)} posts from @{actor}:"]
+        if session_id and session_id in sessions:
+            sessions[session_id]['_last_fetched'] = posts
+            sessions[session_id]['_last_actor'] = actor
+        lines = [f"Fetched {len(posts)} from @{actor}:"]
         for i, p in enumerate(posts[:8], 1):
             media = f" [{len(p.get('images') or [])} img]" if p.get('images') else ""
             lines.append(f"{i}. {(p.get('text') or '')[:70]}{media}")
-        if len(posts) > 8:
-            lines.append(f"...and {len(posts)-8} more")
         lines.append("\nSay “save them to vault” to store them.")
-        if session_id in sessions:
-            sessions[session_id]['_last_fetched'] = posts
-            sessions[session_id]['_last_actor'] = actor
         return "\n".join(lines)
 
     if any(w in lower for w in ('save', 'add to vault', 'vault them')):
         if not session_id or session_id not in sessions:
-            return "Not logged in / no recent fetch. Fetch posts first."
+            return "Fetch posts first."
         posts = sessions[session_id].get('_last_fetched') or []
         if not posts:
-            return "No recent fetch to save. Fetch posts first."
-        actor = sessions[session_id].get('_last_actor')
-        r = tool_add_to_vault(posts, handler_handle=actor)
-        return r.get('message') or r.get('error') or str(r)
+            return "No recent fetch."
+        return tool_add_to_vault(posts, handler_handle=sessions[session_id].get('_last_actor')).get('message')
 
     id_m = re.search(r'post\s+(?:id\s+)?(\d+)', lower)
-    if id_m or re.search(r'\bid\s*(\d+)\b', lower):
-        vid = int(id_m.group(1) if id_m else re.search(r'\bid\s*(\d+)\b', lower).group(1))
-        result = tool_post_now(vault_id=vid)
-        return result.get('message') or result.get('error') or str(result)
+    if id_m:
+        return tool_post_now(vault_id=int(id_m.group(1))).get('message') or str(
+            tool_post_now(vault_id=int(id_m.group(1)))
+        )
 
-    if re.search(r'post\s+(this\s+)?(image|photo|pic)?\s*(to\s+)?(facebook)?', lower) or \
-       ('facebook' in lower and 'post' in lower) or \
-       ('post' in lower and 'vault' in lower) or 'post now' in lower or 'post them' in lower:
+    if 'post' in lower and ('facebook' in lower or 'vault' in lower or 'now' in lower):
         count_m = re.search(r'(\d+)\s*posts?', lower)
         count = int(count_m.group(1)) if count_m else 1
         if count > 1:
-            result = tool_post_vault_batch(count=count)
-        else:
-            r = tool_list_vault(limit=5)
-            items = r.get('vault') or []
-            if not items:
-                return "No vault items to post. Fetch Bluesky posts and save them first."
-            chosen = None
-            for it in items:
-                if it.get('images'):
-                    chosen = it
-                    break
-            chosen = chosen or items[0]
-            result = tool_post_now(vault_id=chosen.get('id'))
-        return result.get('message') or result.get('error') or str(result)
-
-    if any(w in lower for w in ('remove pipeline', 'delete pipeline', 'remove auto', 'delete auto')):
-        m = re.search(r'(?:remove|delete)\s+(?:pipeline|auto)\s+([a-zA-Z0-9._-]+)', msg, re.I)
-        if m:
-            return tool_auto_remove(m.group(1)).get('message') or str(tool_auto_remove(m.group(1)))
-        return "Say: Remove pipeline <name>"
-
-    if any(w in lower for w in ('auto status', 'autopilot', 'auto pilot')):
-        return tool_auto_status().get('message', str(tool_auto_status()))
-    if any(w in lower for w in ('stop auto', 'auto stop', 'disable auto')):
-        return tool_auto_stop().get('message')
-    if any(w in lower for w in ('start auto', 'auto start', 'go autonomous')):
-        return str(tool_auto_start())
-    if 'auto run' in lower or 'run auto' in lower:
-        return str(tool_auto_run_now())
+            return tool_post_vault_batch(count=count).get('message')
+        r = tool_list_vault(limit=5)
+        items = r.get('vault') or []
+        if not items:
+            return "No vault items. Fetch and save first."
+        chosen = next((it for it in items if it.get('images')), items[0])
+        return tool_post_now(vault_id=chosen.get('id')).get('message')
 
     # auto setup pattern
     m = re.search(
         r'auto\s+setup.*?watch\s+@?([a-zA-Z0-9._-]+).*?(?:post\s+to|to)\s+@?([a-zA-Z0-9._-]+)',
-        msg, re.I
+        msg, re.I,
     )
     if m or ('auto setup' in lower and 'watch' in lower):
         if m:
             return tool_auto_setup(
                 name='default',
                 source_handle=m.group(1),
-                account_username=m.group(2)
+                account_username=m.group(2),
+                enabled=True,
             ).get('message')
-        return "Say: Auto setup watch @blueskyhandle post to @facebookusername every 5 minutes"
+        return "Say: Auto setup watch @blueskyhandle post to @facebookusername"
 
     return (
         "Bluesky → Facebook vault.\n"
-        "I can: login, fetch, save to vault, post now (by id), auto pilot, status.\n"
         "Examples:\n"
         "  Login with handle and app-password\n"
         "  Fetch 10 posts from @someone.bsky.social\n"
-        "  Save them to vault\n"
-        "  Post id 2\n"
-        "  Auto setup watch zorrito post to myfacebook every 5 minutes\n"
-        "  Start auto / Stop auto / Auto status"
+        "  Save them to vault · Post id 2\n"
+        "  Auto setup watch zorrito post to MyPage every 5 minutes\n"
+        "  start pipeline default · stop pipeline default · auto status · list pipelines"
     )
 
 
 def _sanitize_reply_facebook_only(reply: str) -> str:
-    """Rewrite any non-Bluesky/Facebook social names out of model replies."""
     if not reply or not isinstance(reply, str):
         return reply or ""
     text = reply
-    replacements = [
+    for pat, repl in [
         (r'(?i)\binstagram\b', 'Facebook'),
         (r'(?i)\bthreads\b', 'Facebook'),
-        (r'(?i)\bI post to\s+\*?\*?Facebook\*?\*?', 'I post to **Facebook**'),
-    ]
-    for pat, repl in replacements:
+    ]:
         text = re.sub(pat, repl, text)
     return text
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
+# ============================================================
+# CHAT API
+# ============================================================
 
 @app.route('/api/chat', methods=['POST'])
 def api_chat():
@@ -3196,70 +3045,53 @@ def api_chat():
     if not message:
         return jsonify({"success": False, "error": "Empty message"}), 400
 
-    print(f"\n{'='*50}")
-    print(f"📨 Message: {message[:50]}{'...' if len(message) > 50 else ''}")
-    print(f"🔑 Gemini keys available: {len(GEMINI_API_KEYS)}")
-    print(f"📊 History length: {len(history)}")
-
-    # Keyword fallback first for reliability
     if not GEMINI_API_KEYS:
-        print("⚠️ No Gemini keys, using fallback")
         reply = simple_fallback(message, session_id)
         return jsonify({
             "success": True,
             "reply": _sanitize_reply_facebook_only(reply),
             "tool_results": [],
             "chat_key": chat_key,
-            "session_id": session_id
+            "session_id": session_id,
         })
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for h in history[-10:]:
         if h.get('role') in ('user', 'assistant') and h.get('content'):
-            # Drop old assistant turns that named other networks
             content = h.get('content') or ''
             if h.get('role') == 'assistant' and re.search(r'(?i)\b(instagram|threads)\b', content):
                 continue
             messages.append({"role": h['role'], "content": content})
     messages.append({"role": "user", "content": message})
 
-    print(f"📤 Calling Gemini with {len(messages)} messages")
-    
-    # Try with model fallback
     data_g, err = call_gemini(messages, tools=TOOLS_SCHEMA)
     tool_results = []
 
     if err or not data_g:
-        print(f"❌ All Gemini models failed: {err}")
         reply = simple_fallback(message, session_id)
         return jsonify({
             "success": True,
             "reply": _sanitize_reply_facebook_only(reply),
             "tool_results": [],
             "chat_key": chat_key,
-            "session_id": session_id
+            "session_id": session_id,
         })
 
     try:
         choice = data_g['choices'][0]['message']
         tool_calls = choice.get('tool_calls') or []
-
         if tool_calls:
-            print(f"🔧 Tool calls: {[tc.get('function', {}).get('name') for tc in tool_calls]}")
             messages.append(choice)
             for tc in tool_calls:
                 fn = tc.get('function') or {}
                 name = fn.get('name')
                 try:
                     args = json.loads(fn.get('arguments') or '{}')
-                    print(f"   📌 {name}({args})")
                 except Exception:
                     args = {}
                 result = execute_tool(name, args, session_id=session_id)
-                # Capture session from login
                 if result.get('session_id'):
                     session_id = result['session_id']
-                # Stash fetches
                 if name == 'fetch_posts' and result.get('success') and session_id in sessions:
                     sessions[session_id]['_last_fetched'] = result.get('posts') or []
                     sessions[session_id]['_last_actor'] = result.get('actor')
@@ -3267,54 +3099,152 @@ def api_chat():
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.get('id'),
-                    "content": json.dumps(result)
+                    "content": json.dumps(result),
                 })
-
-            # Final call with tool results - uses model fallback
             final_data, final_err = call_gemini(messages)
             if final_err or not final_data:
-                print(f"❌ Final Gemini failed: {final_err}")
                 reply = format_tool_summary(tool_results)
             else:
                 reply = final_data['choices'][0]['message'].get('content') or format_tool_summary(tool_results)
-                print(f"📤 Gemini final reply: {reply[:50]}...")
         else:
             reply = choice.get('content') or simple_fallback(message, session_id)
-            print(f"📤 Gemini direct reply: {reply[:50]}...")
 
-        print(f"{'='*50}\n")
         return jsonify({
             "success": True,
             "reply": _sanitize_reply_facebook_only(reply),
             "tool_results": tool_results,
             "chat_key": chat_key,
-            "session_id": session_id
+            "session_id": session_id,
         })
-        
     except Exception as e:
-        print(f"❌ Error processing Gemini response: {e}")
+        print(f"chat error: {e}")
         reply = simple_fallback(message, session_id)
         return jsonify({
             "success": True,
             "reply": _sanitize_reply_facebook_only(reply),
             "tool_results": tool_results,
             "chat_key": chat_key,
-            "session_id": session_id
+            "session_id": session_id,
         })
 
 
-
-
-
-
-
-
-
-
-
 # ============================================================
-# IMAGE UPLOAD → POST / SCHEDULE / VAULT (UI)
+# REST / UI ENDPOINTS
 # ============================================================
+
+@app.route('/api/status', methods=['GET'])
+def api_status():
+    return jsonify(tool_get_status())
+
+
+@app.route('/api/accounts', methods=['GET'])
+def api_accounts():
+    return jsonify(tool_list_accounts('facebook'))
+
+
+@app.route('/api/auto/status', methods=['GET'])
+def api_auto_status():
+    return jsonify(tool_auto_status())
+
+
+@app.route('/api/auto/start', methods=['POST'])
+def api_auto_start():
+    data = request.json or {}
+    name = data.get('name')
+    return jsonify(tool_auto_start(name=name) if name else tool_auto_start())
+
+
+@app.route('/api/auto/stop', methods=['POST'])
+def api_auto_stop():
+    data = request.json or {}
+    name = data.get('name')
+    return jsonify(tool_auto_stop(name=name) if name else tool_auto_stop())
+
+
+@app.route('/api/auto/remove', methods=['POST'])
+def api_auto_remove():
+    data = request.json or {}
+    name = data.get('name')
+    if not name:
+        return jsonify({"success": False, "error": "name required"}), 400
+    return jsonify(tool_auto_remove(name))
+
+
+@app.route('/api/niche/master-fetch', methods=['POST'])
+def api_master_fetch_niche():
+    data = request.json or {}
+    name = data.get('name')
+    limit_per_source = int(data.get('limit_per_source', 20))
+    result = tool_master_fetch_niche(name=name, limit_per_source=limit_per_source)
+    return jsonify(result), (200 if result.get('success') else 400)
+
+
+@app.route('/api/niche/master-fetch-all', methods=['POST'])
+def api_master_fetch_all():
+    data = request.json or {}
+    limit_per_source = int(data.get('limit_per_source', 20))
+    result = tool_master_fetch_all_niches(limit_per_source=limit_per_source)
+    return jsonify(result), (200 if result.get('success') else 400)
+
+
+@app.route('/api/master/status', methods=['GET'])
+def api_master_status():
+    try:
+        configs = _list_auto_configs()
+        niches = []
+        for cfg in configs:
+            name = cfg.get('name')
+            count = 0
+            conn = get_db_connection()
+            if conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT COUNT(*) FROM vault v
+                    WHERE v.handler_handle = %s
+                    AND NOT EXISTS (
+                        SELECT 1 FROM posted_posts p
+                        WHERE p.uri = v.uri AND p.platform = 'facebook'
+                          AND p.status IN ('completed', 'posted')
+                    )
+                """, (name,))
+                count = cur.fetchone()[0]
+                cur.close()
+                conn.close()
+            niches.append({
+                "niche": name,
+                "count": count,
+                "enabled": cfg.get('enabled', False),
+                "source_handles": cfg.get('source_handles') or [],
+                "destination": cfg.get('account_username'),
+            })
+        return jsonify({
+            "success": True,
+            "master_handle": BLUESKY_MASTER_HANDLE or "Not configured",
+            "niches": niches,
+            "total_reserve": sum(n.get('count', 0) for n in niches),
+            "total_niches": len(niches),
+            "timestamp": datetime.now().isoformat(),
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/cron/auto-run', methods=['GET'])
+def cron_auto_run():
+    try:
+        if not get_cron_state():
+            return jsonify({"success": True, "skipped": True, "reason": "cron disabled"})
+        result = tool_auto_run_now()
+        return jsonify({
+            "success": True,
+            "result": result,
+            "timestamp": datetime.now().isoformat(),
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 @app.route('/api/post-now/accounts', methods=['GET'])
 def api_post_now_accounts():
@@ -3339,7 +3269,7 @@ def api_post_now_image():
             vault_id=vid,
             caption=caption or None,
             account_id=account_id,
-            account_username=account_username
+            account_username=account_username,
         )
         return jsonify(result), (200 if result.get('success') else 500)
 
@@ -3348,26 +3278,23 @@ def api_post_now_image():
 
     resolved = resolve_facebook_account_id(account_id, account_username)
     if not resolved:
-        return jsonify({"success": False, "error": "Could not resolve Facebook account. Connect one in Zernio."}), 400
+        return jsonify({"success": False, "error": "Could not resolve Facebook account"}), 400
 
     jpeg, err = data_url_to_jpeg_bytes(image_data)
     if not jpeg:
         return jsonify({"success": False, "error": err or "Invalid image"}), 400
-
     jpeg = fix_image_for_feed(jpeg)
     public_url = upload_media_to_zernio(jpeg)
     if not public_url:
-        return jsonify({"success": False, "error": "Upload to Zernio failed"}), 500
+        return jsonify({"success": False, "error": "Upload failed"}), 500
 
     result = post_to_facebook(
         image_url=public_url,
         caption=caption or 'Posted via AI Vault',
         account_id=resolved,
-        scheduled_time=None
     )
     if result.get('success'):
         result['message'] = "Posted to Facebook"
-        result['caption'] = caption or 'Posted via AI Vault'
         result['account_id'] = resolved
     return jsonify(result), (200 if result.get('success') else 500)
 
@@ -3382,18 +3309,16 @@ def api_post_now_schedule():
     schedule_time_raw = data.get('schedule_time')
 
     if not image_data:
-        return jsonify({"success": False, "error": "image_data is required"}), 400
+        return jsonify({"success": False, "error": "image_data required"}), 400
 
     resolved = resolve_facebook_account_id(account_id, account_username)
     if not resolved:
         return jsonify({"success": False, "error": "Could not resolve Facebook account"}), 400
 
     scheduled_for = parse_datetime_from_input(schedule_time_raw) if schedule_time_raw else None
-
     jpeg, err = data_url_to_jpeg_bytes(image_data)
     if not jpeg:
         return jsonify({"success": False, "error": err or "Invalid image"}), 400
-
     jpeg = fix_image_for_feed(jpeg)
     public_url = upload_media_to_zernio(jpeg)
     if not public_url:
@@ -3403,14 +3328,13 @@ def api_post_now_schedule():
         image_url=public_url,
         caption=caption,
         account_id=resolved,
-        scheduled_time=scheduled_for
+        scheduled_time=scheduled_for,
     )
     if result.get('success'):
         when = scheduled_for.strftime('%Y-%m-%d %H:%M') if scheduled_for else 'ASAP'
         result['message'] = f"Scheduled to Facebook for {when}"
-        result['caption'] = caption
-        result['account_id'] = resolved
         result['scheduled_for'] = when
+        result['account_id'] = resolved
     return jsonify(result), (200 if result.get('success') else 500)
 
 
@@ -3419,9 +3343,8 @@ def api_vault_add_image():
     data = request.json or {}
     image_data = data.get('image_data') or data.get('image')
     caption = (data.get('caption') or '').strip() or 'Saved from AI Vault'
-
     if not image_data:
-        return jsonify({"success": False, "error": "image_data is required"}), 400
+        return jsonify({"success": False, "error": "image_data required"}), 400
 
     public_url = None
     jpeg, err = data_url_to_jpeg_bytes(image_data)
@@ -3432,10 +3355,9 @@ def api_vault_add_image():
     image_entry = {
         "url": public_url or image_data,
         "thumb": public_url or image_data,
-        "alt": caption[:120]
+        "alt": caption[:120],
     }
     uri = f"local:upload:{uuid.uuid4()}"
-
     try:
         conn = get_db_connection()
         if not conn:
@@ -3446,14 +3368,8 @@ def api_vault_add_image():
             VALUES (%s, %s, %s, %s, %s, 0, 0, 0, %s, %s, %s)
             RETURNING id
         ''', (
-            uri,
-            'upload',
-            'Manual upload',
-            caption,
-            Json([image_entry]),
-            datetime.now().isoformat(),
-            'manual',
-            "Uploaded via UI · platform=facebook"
+            uri, 'upload', 'Manual upload', caption, Json([image_entry]),
+            datetime.now().isoformat(), 'manual', "Uploaded via UI · platform=facebook",
         ))
         row = cur.fetchone()
         conn.commit()
@@ -3464,40 +3380,10 @@ def api_vault_add_image():
             "vault_id": row[0] if row else None,
             "uri": uri,
             "message": "Image saved to vault",
-            "caption": caption
         })
     except Exception as e:
         traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
-
-
-# ============================================================
-# BASIC REST
-# ============================================================
-
-@app.route('/api/status', methods=['GET'])
-def api_status():
-    return jsonify(tool_get_status())
-
-
-@app.route('/api/accounts', methods=['GET'])
-def api_accounts():
-    return jsonify(tool_list_accounts('facebook'))
-
-
-@app.route('/api/auto/status', methods=['GET'])
-def api_auto_status():
-    return jsonify(tool_auto_status())
-
-
-@app.route('/api/auto/start', methods=['POST'])
-def api_auto_start():
-    return jsonify(tool_auto_start())
-
-
-@app.route('/api/auto/stop', methods=['POST'])
-def api_auto_stop():
-    return jsonify(tool_auto_stop())
 
 
 @app.route('/')
@@ -3505,39 +3391,29 @@ def index():
     return send_from_directory('static', 'index.html')
 
 
-
-
-
-
-
-
-
+handler = app
 
 if __name__ == '__main__':
     print("🚀 Bluesky AI Vault → Facebook starting...")
     if GEMINI_API_KEYS:
-        print(f"✅ Gemini keys loaded: {len(GEMINI_API_KEYS)} (round-robin)")
+        print(f"✅ Gemini keys: {len(GEMINI_API_KEYS)}")
     else:
-        print("⚠️  No GEMINI_API_KEYS — using keyword fallback only")
+        print("⚠️  No GEMINI_API_KEYS — keyword fallback only")
 
-    # Only run these on full server, not on Vercel
     if not IS_VERCEL:
-        # ===== AUTO-RESTORE BLUESKY SESSION ON STARTUP =====
         try:
             conn = get_db_connection()
             if conn:
                 cur = conn.cursor()
                 cur.execute("""
-                    SELECT session_id, session_string, handle, display_name 
-                    FROM sessions 
-                    WHERE expires_at > CURRENT_TIMESTAMP 
-                    ORDER BY last_used_at DESC 
-                    LIMIT 1
+                    SELECT session_id, session_string, handle, display_name
+                    FROM sessions
+                    WHERE expires_at > CURRENT_TIMESTAMP
+                    ORDER BY last_used_at DESC LIMIT 1
                 """)
                 row = cur.fetchone()
                 cur.close()
                 conn.close()
-                
                 if row:
                     session_id, session_string, handle, display_name = row
                     try:
@@ -3549,39 +3425,32 @@ if __name__ == '__main__':
                             'session_string': session_string,
                             'display_name': display_name or handle,
                         }
-                        print(f"✅ Auto-restored Bluesky session for @{handle}")
-                        print(f"   Session ID: {session_id}")
+                        print(f"✅ Restored Bluesky session @{handle}")
                     except Exception as e:
-                        print(f"⚠️ Could not restore session: {e}")
-                else:
-                    print("ℹ️ No saved Bluesky session found. Login required.")
+                        print(f"⚠️ Session restore: {e}")
         except Exception as e:
             print(f"⚠️ Session restore error: {e}")
 
-        # ===== ZERNIO API KEYS =====
         zernio_status = ensure_zernio_keys_loaded()
-        if not zernio_status.get('success'):
-            print("⚠️  Facebook posting will fail until ZERNIO_API_KEY is set in .env")
-        else:
+        if zernio_status.get('success'):
             try:
                 synced = refresh_all_zernio_accounts()
                 print(f"✅ Synced {len(synced) if synced else 0} Facebook account(s)")
             except Exception as e:
                 print(f"⚠️ Account sync: {e}")
+        else:
+            print("⚠️  Set ZERNIO_API_KEY for Facebook posting")
 
-        # ===== AUTO PILOT (disabled on Vercel) =====
         try:
             enabled = [c for c in _list_auto_configs() if c.get('enabled')]
             if enabled:
                 start_result = start_auto_pilot()
-                if start_result.get('success'):
-                    print(f"🤖 Auto pilot resumed ({len(enabled)} pipeline(s) → Facebook)")
-                else:
-                    print(f"🤖 Auto pilot NOT started: {start_result.get('message')}")
+                print(f"🤖 Auto pilot: {start_result.get('message')}")
             else:
-                print("🤖 Auto pilot idle (enable via chat)")
+                print("🤖 Auto pilot idle")
         except Exception as e:
             print(f"Auto pilot init: {e}")
 
     port = int(os.environ.get('PORT', 10000))
+    print(f"🚀 Server on port {port}")
     app.run(debug=False, host='0.0.0.0', port=port)
