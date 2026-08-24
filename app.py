@@ -60,6 +60,12 @@ SCHEDULE_TIMEZONE = "Africa/Nairobi"
 TIMEZONE = "Africa/Nairobi"
 LOCAL_TIMEZONE = pytz.timezone(TIMEZONE)
 
+# Master-fetch / “fill reserve” — NEW media posts per source per click
+# Cursor continues until target met or feed ends (safety max pages)
+# Override: MASTER_FETCH_LIMIT=50  MASTER_FETCH_MAX_PAGES=50
+MASTER_FETCH_LIMIT = int(os.environ.get('MASTER_FETCH_LIMIT', '50'))
+MASTER_FETCH_MAX_PAGES = int(os.environ.get('MASTER_FETCH_MAX_PAGES', '50'))
+
 # ============================================================
 # GEMINI
 # ============================================================
@@ -1474,33 +1480,51 @@ def _client_auth_headers(client):
 
 
 def _extract_images_from_embed(embed):
-    """Parse images (and video thumbnails) from a raw embed dict."""
+    """Parse images, video thumbs, and external thumbs from a raw Bluesky embed dict."""
     images = []
     if not embed or not isinstance(embed, dict):
         return images
-    etype = embed.get('$type') or embed.get('py_type') or ''
+    etype = str(embed.get('$type') or embed.get('py_type') or '')
 
-    # Images embed
+    # app.bsky.embed.images#view
     if 'embed.images' in etype or embed.get('images'):
         for im in embed.get('images') or []:
             if not isinstance(im, dict):
                 continue
-            url = im.get('fullsize') or im.get('thumb')
+            url = im.get('fullsize') or im.get('fullSize') or im.get('thumb')
             if url:
                 images.append({"url": url, "thumb": im.get('thumb') or url})
 
-    # Video embed — use thumbnail as still image for FB photo posts
-    if 'embed.video' in etype:
-        thumb = embed.get('thumbnail')
-        if thumb:
+    # app.bsky.embed.video#view
+    if 'embed.video' in etype or (embed.get('playlist') and embed.get('thumbnail')):
+        thumb = embed.get('thumbnail') or embed.get('thumb')
+        if isinstance(thumb, dict):
+            thumb = thumb.get('url') or thumb.get('$link')
+        if thumb and isinstance(thumb, str):
             images.append({"url": thumb, "thumb": thumb, "is_video_thumb": True})
+
+    # app.bsky.embed.external#view
+    if 'embed.external' in etype or isinstance(embed.get('external'), dict):
+        ext = embed.get('external') if isinstance(embed.get('external'), dict) else {}
+        thumb = ext.get('thumb') or ext.get('thumbnail')
+        if isinstance(thumb, dict):
+            thumb = thumb.get('url') if isinstance(thumb.get('url'), str) else None
+        if thumb and isinstance(thumb, str):
+            images.append({"url": thumb, "thumb": thumb, "is_external_thumb": True})
 
     # recordWithMedia — nested media
     media = embed.get('media')
     if isinstance(media, dict):
         images.extend(_extract_images_from_embed(media))
 
-    return images
+    seen = set()
+    uniq = []
+    for im in images:
+        u = im.get('url')
+        if u and u not in seen:
+            seen.add(u)
+            uniq.append(im)
+    return uniq
 
 
 def _parse_feed_items(feed_items, actor):
@@ -2766,13 +2790,12 @@ def _vault_known_uris(handler_handle=None):
     return known
 
 
-def tool_master_fetch_niche(name=None, limit_per_source=80, max_pages=10):
+def tool_master_fetch_niche(name=None, limit_per_source=None, max_pages=None):
     """
     Fill niche reserve from Bluesky sources.
 
     Each click aims for `limit_per_source` **NEW** media posts (not already in vault).
-    Already-fetched URIs are skipped; pagination continues until the new quota is
-    met or pages/cursor run out — so refill is not stuck on the first 20 again.
+    Defaults: MASTER_FETCH_LIMIT (env or 50), MASTER_FETCH_MAX_PAGES (env or 10).
     """
     if not name:
         return {"success": False, "error": "name required"}
@@ -2790,13 +2813,19 @@ def tool_master_fetch_niche(name=None, limit_per_source=80, max_pages=10):
         return {"success": False, "error": "No Bluesky session / master account"}
 
     # Per-click NEW posts target (ignore ones we already have)
-    target_new = max(10, int(limit_per_source or 80))
-    pages = max(1, min(int(max_pages or 10), 25))
+    target_new = max(5, int(limit_per_source if limit_per_source is not None else MASTER_FETCH_LIMIT))
+    # Always allow a high page budget so cursor can run until target is met
+    pages = max(
+        15,
+        min(int(max_pages if max_pages is not None else MASTER_FETCH_MAX_PAGES), 100),
+    )
     media_only = bool(cfg.get('media_only', True))
 
-    # Skip anything already in vault (global) so we only count truly new inserts
     known = _vault_known_uris(handler_handle=None)
-    print(f"📦 vault already has {len(known)} URIs — will skip those while filling «{name}»")
+    print(
+        f"📦 vault already has {len(known)} URIs — filling «{name}» "
+        f"until +{target_new} NEW media/source (max {pages} pages)"
+    )
 
     all_posts = []
     per_source = {}
@@ -2808,28 +2837,33 @@ def tool_master_fetch_niche(name=None, limit_per_source=80, max_pages=10):
 
         new_for_source = 0
         skipped_known = 0
+        skipped_no_media = 0
         scanned = 0
         cursor = None
+        page_i = 0
 
         try:
-            for page_i in range(pages):
-                if new_for_source >= target_new:
-                    break
+            # Keep following cursor until we have enough NEW posts or feed ends
+            while new_for_source < target_new and page_i < pages:
+                page_i += 1
                 try:
                     batch, cursor = _http_get_author_feed_page(
                         client, actor, limit=100, cursor=cursor
                     )
                 except Exception as e:
-                    print(f"master-fetch page {page_i + 1} @{actor}: {e}")
+                    print(f"master-fetch page {page_i} @{actor}: {e}")
                     break
 
                 if not batch:
+                    print(f"📄 @{actor} page {page_i}: empty — stop")
                     break
 
                 scanned += len(batch)
+                page_media = sum(1 for p in batch if p.get('images'))
                 print(
-                    f"📄 @{actor} page {page_i + 1}: +{len(batch)} items "
-                    f"(new {new_for_source}/{target_new}, skipped_known {skipped_known}, "
+                    f"📄 @{actor} page {page_i}: +{len(batch)} "
+                    f"(media={page_media}, new {new_for_source}/{target_new}, "
+                    f"known {skipped_known}, no_media {skipped_no_media}, "
                     f"cursor={'yes' if cursor else 'end'})"
                 )
 
@@ -2839,11 +2873,11 @@ def tool_master_fetch_niche(name=None, limit_per_source=80, max_pages=10):
                         continue
                     images = p.get('images') or []
                     if media_only and not images:
+                        skipped_no_media += 1
                         continue
                     if uri in known:
                         skipped_known += 1
                         continue
-                    # New post for this fill
                     known.add(uri)
                     all_posts.append({
                         "uri": uri,
@@ -2861,17 +2895,25 @@ def tool_master_fetch_niche(name=None, limit_per_source=80, max_pages=10):
                         break
 
                 if not cursor:
+                    print(f"📄 @{actor}: no more cursor after page {page_i}")
                     break
 
             per_source[actor] = {
                 "new": new_for_source,
                 "skipped_known": skipped_known,
+                "skipped_no_media": skipped_no_media,
                 "scanned": scanned,
+                "pages": page_i,
             }
             print(
-                f"📥 master-fetch @{actor}: {new_for_source} NEW media "
-                f"(scanned {scanned}, already-had {skipped_known})"
+                f"📥 master-fetch @{actor}: {new_for_source}/{target_new} NEW media "
+                f"over {page_i} pages (scanned {scanned}, known {skipped_known}, no_media {skipped_no_media})"
             )
+            if new_for_source < target_new:
+                print(
+                    f"⚠️ @{actor}: only {new_for_source}/{target_new} new — "
+                    f"feed exhausted or all remaining media already in vault"
+                )
         except Exception as e:
             print(f"master fetch {src}: {e}")
             per_source[actor] = {"new": 0, "error": str(e)}
@@ -2899,10 +2941,12 @@ def tool_master_fetch_niche(name=None, limit_per_source=80, max_pages=10):
     }
 
 
-def tool_master_fetch_all_niches(limit_per_source=80, max_pages=8):
+def tool_master_fetch_all_niches(limit_per_source=None, max_pages=None):
     configs = _list_auto_configs()
     if not configs:
         return {"success": False, "error": "No pipelines configured"}
+    limit_per_source = int(limit_per_source if limit_per_source is not None else MASTER_FETCH_LIMIT)
+    max_pages = int(max_pages if max_pages is not None else MASTER_FETCH_MAX_PAGES)
     total_saved = 0
     parts = []
     for c in configs:
@@ -3823,8 +3867,8 @@ def api_auto_remove():
 def api_master_fetch_niche():
     data = request.json or {}
     name = data.get('name')
-    limit_per_source = int(data.get('limit_per_source', 80))
-    max_pages = int(data.get('max_pages', 8))
+    limit_per_source = int(data.get('limit_per_source', MASTER_FETCH_LIMIT))
+    max_pages = int(data.get('max_pages', MASTER_FETCH_MAX_PAGES))
     result = tool_master_fetch_niche(
         name=name,
         limit_per_source=limit_per_source,
@@ -3836,8 +3880,8 @@ def api_master_fetch_niche():
 @app.route('/api/niche/master-fetch-all', methods=['POST'])
 def api_master_fetch_all():
     data = request.json or {}
-    limit_per_source = int(data.get('limit_per_source', 80))
-    max_pages = int(data.get('max_pages', 8))
+    limit_per_source = int(data.get('limit_per_source', MASTER_FETCH_LIMIT))
+    max_pages = int(data.get('max_pages', MASTER_FETCH_MAX_PAGES))
     result = tool_master_fetch_all_niches(
         limit_per_source=limit_per_source,
         max_pages=max_pages,

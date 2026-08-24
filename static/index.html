@@ -903,7 +903,8 @@ async function masterFetchNiche(nicheName) {
         const res = await fetch(`${API}/api/niche/master-fetch`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name: nicheName, limit_per_source: 20 })
+            // Cursor continues until limit_per_source NEW posts (or max_pages)
+            body: JSON.stringify({ name: nicheName, limit_per_source: 50, max_pages: 50 })
         });
         const data = await res.json();
         if (data.success) {
@@ -923,7 +924,7 @@ async function masterFetchAll() {
         const res = await fetch(`${API}/api/niche/master-fetch-all`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ limit_per_source: 20 })
+            body: JSON.stringify({ limit_per_source: 50, max_pages: 50 })
         });
         const data = await res.json();
         if (data.success) {
