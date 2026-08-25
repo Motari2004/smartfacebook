@@ -2856,9 +2856,12 @@ def _run_one_pipeline(cfg):
             if conn:
                 cur = conn.cursor(cursor_factory=RealDictCursor)
 
+                # Fetch MORE posts than needed (3x) to handle duplicates/failures
+                fetch_limit = remaining * 3
+                print(f"   🔍 Fetching up to {fetch_limit} reserve posts (3x needed)")
+
                 # UPDATED RESERVE QUERY - Skips external links, recently failed
                 # posts, AND permanently-duplicate posts (409 from Zernio).
-                # NOTE: literal % in LIKE patterns must be escaped as %% for psycopg2
                 cur.execute("""
                     SELECT v.* FROM vault v
                     WHERE v.handler_handle = %s
@@ -2891,7 +2894,7 @@ def _run_one_pipeline(cfg):
                     )
                     ORDER BY v.saved_at ASC
                     LIMIT %s
-                """, (name, name, remaining))
+                """, (name, name, fetch_limit))
 
                 reserve = cur.fetchall()
                 print(f"   📦 Found {len(reserve)} unposted posts in reserve")
@@ -2899,7 +2902,13 @@ def _run_one_pipeline(cfg):
                 cur.close()
                 conn.close()
 
+                # Loop through reserve until we post enough or run out
                 for item in reserve:
+                    # Check if we've posted enough
+                    if posted_from_reserve >= remaining:
+                        print(f"   ✅ Reached target of {remaining} posts, stopping")
+                        break
+
                     # Check if the image is actually a valid image URL
                     images = item.get('images') or []
                     if isinstance(images, str):
@@ -2942,11 +2951,13 @@ def _run_one_pipeline(cfg):
                     if res.get('success'):
                         posted_from_reserve += 1
                         _mark_seen(name, item.get('uri'), posted=True)
+                        print(f"   ✅ Posted {posted_from_reserve}/{remaining} reserve posts")
                     else:
                         # Mark as seen with posted=False so it won't be retried immediately
-                        # (still fine even for duplicates — the posted_posts.status='duplicate'
-                        # check above is what actually stops it being selected again)
                         _mark_seen(name, item.get('uri'), posted=False)
+                        print(f"   ⏭️ Skipping failed post, continuing to next")
+
+                print(f"   📊 Final reserve posts posted: {posted_from_reserve}/{remaining}")
         except Exception as e:
             print(f"   ❌ Reserve query error: {e}")
             traceback.print_exc()
