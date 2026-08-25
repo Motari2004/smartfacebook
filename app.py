@@ -2516,7 +2516,7 @@ def tool_auto_setup(name='default', source_handle=None, account_username=None,
                     account_id=None, poll_interval_sec=300, max_posts_per_run=2,
                     media_only=True, include_reposts=False, enabled=False,
                     source_handles=None, niche=None, content_type='feed'):
-    """Create/update a pipeline. Facebook destination is OPTIONAL — can set later."""
+    """Smart setup - validates account info at creation time"""
     name = (name or 'default').strip()
     sources = source_handles
     if not sources and source_handle:
@@ -2529,52 +2529,173 @@ def tool_auto_setup(name='default', source_handle=None, account_username=None,
         sources = [s.lstrip('@') for s in sources if s]
     if not sources:
         return {"success": False, "error": "source_handle or source_handles required"}
-
-    # Optional FB account: auto-pick only if exactly one connected; never fail if missing
-    if not account_username and not account_id:
-        accs = tool_list_accounts('facebook')
-        alist = accs.get('accounts') or []
+    
+    # Smart account validation
+    validated_id = None
+    validated_username = None
+    account_error = None
+    
+    if account_id or account_username:
+        valid, vid, vusername, error = validate_account_config(account_id, account_username)
+        if valid:
+            validated_id = vid
+            validated_username = vusername
+        else:
+            account_error = error
+            # Don't fail setup - just warn and continue without destination
+            print(f"⚠️ Account validation warning: {error}")
+    
+    # If exactly one account exists, auto-use it
+    if not validated_id and not account_error:
+        accounts = tool_list_accounts('facebook')
+        alist = accounts.get('accounts') or []
         if len(alist) == 1:
-            account_username = alist[0].get('username')
-            account_id = alist[0].get('account_id')
-
-    dest_label = None
-    if account_username or account_id:
-        dest_label = f"Facebook @{account_username or account_id}"
-    else:
-        dest_label = "Facebook (destination not set yet)"
-
+            validated_id = alist[0].get('account_id')
+            validated_username = alist[0].get('username') or alist[0].get('display_name')
+            print(f"✅ Auto-selected only available account: {validated_username}")
+    
+    dest_label = "Facebook (destination not set yet)"
+    if validated_id and validated_username:
+        dest_label = f"Facebook @{validated_username} (verified)"
+    elif validated_id:
+        dest_label = f"Facebook ID: {validated_id} (username unknown)"
+    elif account_error:
+        dest_label = f"Facebook (⚠️ {account_error})"
+    
     cfg = {
         'name': name,
         'enabled': bool(enabled),
         'source_handle': sources[0],
         'source_handles': sources,
         'niche': niche or name,
-        'account_username': account_username,
-        'account_id': account_id,
+        'account_username': validated_username,
+        'account_id': validated_id,
         'poll_interval_sec': int(poll_interval_sec or 300),
         'max_posts_per_run': int(max_posts_per_run or 2),
         'media_only': bool(media_only),
         'include_reposts': bool(include_reposts),
         'content_type': content_type or 'feed',
-        'last_error': None,
-        'last_result': 'configured',
+        'last_error': account_error if account_error else None,
+        'last_result': 'configured' + (f" (destination: {validated_username})" if validated_username else ""),
     }
+    
     if not _save_auto_config(cfg):
         return {"success": False, "error": "Failed to save config"}
+    
     tip = ""
-    if not account_username and not account_id:
-        tip = "\nTip: later say “set destination for Lifestyle to @YourPage” or list accounts."
+    if not validated_id:
+        tip = "\n\n💡 Tip: Set destination later with:\n   set destination for {name} to @YourPage"
+    elif account_error:
+        tip = f"\n\n⚠️ Note: {account_error}"
+    
     return {
         "success": True,
         "message": (
-            f"✅ Pipeline '{name}' configured: "
-            f"@{' + @'.join(sources)} → {dest_label} "
-            f"(max {cfg['max_posts_per_run']}/run · driven by external cron)"
+            f"✅ Pipeline '{name}' configured:\n"
+            f"   Sources: @{' + @'.join(sources)}\n"
+            f"   Destination: {dest_label}\n"
+            f"   Max posts: {cfg['max_posts_per_run']}/run\n"
+            f"   Status: {'Enabled' if enabled else 'Disabled (start with start pipeline)'}"
             f"{tip}"
         ),
-        "config": cfg,
+        "config": cfg
     }
+
+
+
+
+
+def validate_account_config(account_id=None, account_username=None):
+    """
+    Smart validation - ensures account_id and account_username match and are valid.
+    Returns (valid, resolved_id, resolved_username, error_message)
+    """
+    # Case 1: Both provided - verify they match
+    if account_id and account_username:
+        conn = get_db_connection()
+        if conn:
+            try:
+                cur = conn.cursor()
+                # Check if this account_id has this username
+                cur.execute("""
+                    SELECT account_id, username, display_name 
+                    FROM zernio_accounts 
+                    WHERE account_id = %s 
+                    AND platform = 'facebook' 
+                    AND is_active = TRUE
+                    AND (LOWER(TRIM(username)) = LOWER(%s) 
+                         OR LOWER(TRIM(display_name)) = LOWER(%s))
+                    LIMIT 1
+                """, (account_id, account_username.strip(), account_username.strip()))
+                row = cur.fetchone()
+                cur.close()
+                conn.close()
+                
+                if row:
+                    return True, row[0], account_username, None
+                else:
+                    # They don't match - find the correct username for this ID
+                    cur = conn.cursor()
+                    cur.execute("""
+                        SELECT account_id, username, display_name 
+                        FROM zernio_accounts 
+                        WHERE account_id = %s 
+                        AND platform = 'facebook' 
+                        AND is_active = TRUE
+                        LIMIT 1
+                    """, (account_id,))
+                    row = cur.fetchone()
+                    cur.close()
+                    conn.close()
+                    
+                    if row:
+                        correct_username = row[1] or row[2]
+                        return False, row[0], correct_username, f"Username mismatch: '{account_username}' should be '{correct_username}'"
+                    else:
+                        return False, None, None, f"Account ID '{account_id}' not found or inactive"
+            except Exception as e:
+                print(f"Validation error: {e}")
+    
+    # Case 2: Only account_id provided - verify it exists
+    if account_id and not account_username:
+        conn = get_db_connection()
+        if conn:
+            try:
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT account_id, username, display_name 
+                    FROM zernio_accounts 
+                    WHERE account_id = %s 
+                    AND platform = 'facebook' 
+                    AND is_active = TRUE
+                    LIMIT 1
+                """, (account_id,))
+                row = cur.fetchone()
+                cur.close()
+                conn.close()
+                
+                if row:
+                    username = row[1] or row[2]
+                    return True, row[0], username, None
+                else:
+                    return False, None, None, f"Account ID '{account_id}' not found or inactive"
+            except Exception as e:
+                print(f"Validation error: {e}")
+    
+    # Case 3: Only username provided - resolve it
+    if account_username and not account_id:
+        resolved_id = resolve_facebook_account_id(account_username=account_username)
+        if resolved_id:
+            return True, resolved_id, account_username, None
+        else:
+            return False, None, None, f"Could not resolve username: '{account_username}'"
+    
+    # Case 4: Nothing provided
+    return False, None, None, "No account information provided"
+
+
+
+
 
 
 def tool_auto_set_destination(name, account_username=None, account_id=None):
