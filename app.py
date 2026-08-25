@@ -2012,10 +2012,13 @@ def tool_list_vault_by_status(status='all', limit=50, pipeline=None, handler_han
             params.append(hh)
 
         if status == 'unposted':
+            # 'duplicate' is a terminal state (Facebook/Zernio rejected as
+            # already-posted content) — exclude it same as posted/scheduled
+            # so unposted counts reflect what's actually still postable.
             where.append("""NOT EXISTS (
                 SELECT 1 FROM posted_posts p
                 WHERE p.uri = v.uri AND p.platform = 'facebook'
-                  AND p.status IN ('completed', 'posted', 'scheduled')
+                  AND p.status IN ('completed', 'posted', 'scheduled', 'duplicate')
             )""")
         elif status == 'posted':
             where.append("""EXISTS (
@@ -2027,6 +2030,11 @@ def tool_list_vault_by_status(status='all', limit=50, pipeline=None, handler_han
             where.append("""EXISTS (
                 SELECT 1 FROM posted_posts p
                 WHERE p.uri = v.uri AND p.platform = 'facebook' AND p.status = 'scheduled'
+            )""")
+        elif status == 'duplicate':
+            where.append("""EXISTS (
+                SELECT 1 FROM posted_posts p
+                WHERE p.uri = v.uri AND p.platform = 'facebook' AND p.status = 'duplicate'
             )""")
 
         sql_where = ("WHERE " + " AND ".join(where)) if where else ""
@@ -2172,7 +2180,20 @@ def tool_post_now(vault_id=None, uri=None, caption=None, account_username=None, 
             account_username=account_username,
             content_type=content_type or 'feed',
         )
-        status = 'posted' if result.get('success') else 'failed'
+
+        # Distinguish terminal failures (will never succeed on retry) from
+        # transient ones. Duplicate-content 409s are permanent for this
+        # vault item — mark them 'duplicate' so pipelines skip them forever
+        # instead of retrying every cron run.
+        if result.get('success'):
+            status = 'posted'
+        else:
+            err_text = (result.get('error') or result.get('message') or '').lower()
+            if 'duplicate' in err_text:
+                status = 'duplicate'
+            else:
+                status = 'failed'
+
         _mark_posted(
             vault_id=item.get('id'),
             uri=item.get('uri'),
@@ -2183,6 +2204,9 @@ def tool_post_now(vault_id=None, uri=None, caption=None, account_username=None, 
         )
         if result.get('success'):
             result['message'] = f"Posted vault #{item.get('id')} to Facebook"
+            result['vault_id'] = item.get('id')
+        elif status == 'duplicate':
+            result['message'] = f"Vault #{item.get('id')} is a duplicate on Facebook — skipping permanently"
             result['vault_id'] = item.get('id')
         return result
     except Exception as e:
@@ -2832,7 +2856,8 @@ def _run_one_pipeline(cfg):
             if conn:
                 cur = conn.cursor(cursor_factory=RealDictCursor)
 
-                # UPDATED RESERVE QUERY - Skips external links and recently failed posts
+                # UPDATED RESERVE QUERY - Skips external links, recently failed
+                # posts, AND permanently-duplicate posts (409 from Zernio).
                 # NOTE: literal % in LIKE patterns must be escaped as %% for psycopg2
                 cur.execute("""
                     SELECT v.* FROM vault v
@@ -2840,7 +2865,7 @@ def _run_one_pipeline(cfg):
                     AND NOT EXISTS (
                         SELECT 1 FROM posted_posts p
                         WHERE p.uri = v.uri AND p.platform = 'facebook'
-                          AND p.status IN ('completed', 'posted')
+                          AND p.status IN ('completed', 'posted', 'duplicate')
                     )
                     AND NOT EXISTS (
                         SELECT 1 FROM auto_seen s
@@ -2919,6 +2944,8 @@ def _run_one_pipeline(cfg):
                         _mark_seen(name, item.get('uri'), posted=True)
                     else:
                         # Mark as seen with posted=False so it won't be retried immediately
+                        # (still fine even for duplicates — the posted_posts.status='duplicate'
+                        # check above is what actually stops it being selected again)
                         _mark_seen(name, item.get('uri'), posted=False)
         except Exception as e:
             print(f"   ❌ Reserve query error: {e}")
