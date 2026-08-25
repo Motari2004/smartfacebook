@@ -1598,8 +1598,27 @@ def _parse_feed_items(feed_items, actor):
         post = item.get('post') or {}
         record = post.get('record') or {}
         author = post.get('author') or {}
+        
+        # ===== SKIP REPOSTS =====
+        reason = item.get('reason')
+        if reason and reason.get('$type') and 'repost' in reason.get('$type', ''):
+            print(f"⏭️ Skipping repost: {post.get('uri', '')[:50]}...")
+            continue
+        
+        # ===== SKIP REPLIES =====
+        if record.get('reply'):
+            print(f"⏭️ Skipping reply: {post.get('uri', '')[:50]}...")
+            continue
+        
+        # ===== ONLY POSTS FROM THE ACTUAL AUTHOR =====
+        post_author = author.get('handle')
+        if post_author and post_author.lower() != actor.lower():
+            print(f"⏭️ Skipping post from other author: {post_author}")
+            continue
+        
         embed = post.get('embed') or {}
         images = _extract_images_from_embed(embed)
+        
         posts.append({
             "uri": post.get('uri'),
             "author": author.get('handle') or actor,
@@ -1610,7 +1629,7 @@ def _parse_feed_items(feed_items, actor):
             "reposts": post.get('repostCount') or 0,
             "replies": post.get('replyCount') or 0,
             "created_at": record.get('createdAt'),
-            "is_repost": item.get('reason') is not None,
+            "is_repost": False,
         })
     return posts
 
@@ -1662,19 +1681,13 @@ def _http_get_author_feed_page(client, actor, limit=50, cursor=None):
 
 def _raw_get_author_feed(client, actor, limit=20, max_pages=1):
     """
-    Fetch author feed via raw HTTP so video embeds don't break atproto models.
-    Paginates with cursor when max_pages > 1 (or when limit > one page).
-
-    Args:
-        limit: target number of posts to return (capped across pages)
-        max_pages: max XRPC pages to walk (each page up to 100 items)
+    Fetch author feed - only original posts, no reposts, no replies.
     """
     actor = (actor or '').strip().lstrip('@')
     if actor and '.' not in actor:
         actor = actor + '.bsky.social'
 
     target = max(1, int(limit or 20))
-    # Auto page when caller asks for more than one Bluesky page
     pages = max(1, int(max_pages or 1))
     if target > 50 and pages < 2:
         pages = min(10, (target + 49) // 50)
@@ -1686,65 +1699,73 @@ def _raw_get_author_feed(client, actor, limit=20, max_pages=1):
 
     for page_i in range(pages):
         try:
-            batch, cursor = _http_get_author_feed_page(
-                client, actor, limit=page_size, cursor=cursor
+            # ===== USE FILTER='posts_with_media' =====
+            feed = client.get_author_feed(
+                actor=actor,
+                limit=page_size,
+                cursor=cursor,
+                filter='posts_with_media'
             )
-        except Exception as e:
-            if page_i == 0:
-                # Last resort: typed client (may fail on video)
-                print(f"raw feed failed ({e}); trying typed client")
-                try:
-                    feed = client.get_author_feed(actor=actor, limit=min(target, 50))
-                    posts = []
-                    for item in feed.feed:
-                        post = item.post
-                        record = post.record
-                        images = []
-                        view_embed = getattr(post, 'embed', None)
-                        if view_embed:
-                            imgs = getattr(view_embed, 'images', None)
-                            if imgs:
-                                for im in imgs:
-                                    u = getattr(im, 'fullsize', None) or getattr(im, 'thumb', None)
-                                    if u:
-                                        images.append({"url": u, "thumb": getattr(im, 'thumb', u)})
-                        posts.append({
-                            "uri": post.uri,
-                            "author": post.author.handle if post.author else actor,
-                            "display_name": getattr(post.author, 'display_name', None),
-                            "text": getattr(record, 'text', '') or '',
-                            "images": images,
-                            "likes": getattr(post, 'like_count', 0) or 0,
-                            "reposts": getattr(post, 'repost_count', 0) or 0,
-                            "replies": getattr(post, 'reply_count', 0) or 0,
-                            "created_at": getattr(record, 'created_at', None),
-                            "is_repost": getattr(item, 'reason', None) is not None,
-                        })
-                    return posts[:target]
-                except Exception as e2:
-                    print(f"typed client also failed: {e2}")
-                    raise e
-            print(f"feed page {page_i + 1} failed for @{actor}: {e}")
-            break
-
-        if not batch:
-            break
-
-        for p in batch:
-            uri = p.get('uri')
-            if uri and uri in seen_uris:
-                continue
-            if uri:
+            
+            for item in feed.feed:
+                post = item.post
+                uri = post.uri
+                
+                if uri in seen_uris:
+                    continue
                 seen_uris.add(uri)
-            all_posts.append(p)
-            if len(all_posts) >= target:
+                
+                # Skip reposts
+                if getattr(item, 'reason', None) is not None:
+                    print(f"⏭️ Skipping repost: {uri[:50]}...")
+                    continue
+                
+                # Skip replies
+                if hasattr(post.record, 'reply') and post.record.reply:
+                    print(f"⏭️ Skipping reply: {uri[:50]}...")
+                    continue
+                
+                # Only posts from the actual actor
+                if post.author.handle.lower() != actor.lower():
+                    print(f"⏭️ Skipping post from {post.author.handle}")
+                    continue
+                
+                # Extract images
+                images = []
+                view_embed = getattr(post, 'embed', None)
+                if view_embed:
+                    imgs = getattr(view_embed, 'images', None)
+                    if imgs:
+                        for im in imgs:
+                            u = getattr(im, 'fullsize', None) or getattr(im, 'thumb', None)
+                            if u:
+                                images.append({"url": u, "thumb": getattr(im, 'thumb', u)})
+                
+                if not images:
+                    continue
+                
+                all_posts.append({
+                    "uri": uri,
+                    "author": post.author.handle,
+                    "display_name": getattr(post.author, 'display_name', None) or post.author.handle,
+                    "text": getattr(post.record, 'text', '') or '',
+                    "images": images,
+                    "likes": getattr(post, 'like_count', 0) or 0,
+                    "reposts": getattr(post, 'repost_count', 0) or 0,
+                    "replies": getattr(post, 'reply_count', 0) or 0,
+                    "created_at": getattr(post.record, 'created_at', None),
+                    "is_repost": False,
+                })
+                
+                if len(all_posts) >= target:
+                    break
+            
+            cursor = getattr(feed, 'cursor', None)
+            if not cursor or len(all_posts) >= target:
                 break
-
-        print(f"📄 @{actor} page {page_i + 1}: +{len(batch)} items (total {len(all_posts)}, cursor={'yes' if cursor else 'end'})")
-
-        if len(all_posts) >= target:
-            break
-        if not cursor:
+                
+        except Exception as e:
+            print(f"feed page {page_i + 1} failed for @{actor}: {e}")
             break
 
     return all_posts[:target]

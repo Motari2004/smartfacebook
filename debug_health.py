@@ -1,11 +1,12 @@
 # ============================================================
-# DEBUG SCRIPT - Check Health Pipeline Configuration
+# DEBUG SCRIPT - Check ALL Pipelines Configuration
 # ============================================================
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import os
 import json
+from datetime import datetime
 
 # Database connection
 DATABASE_URL = os.environ.get(
@@ -13,174 +14,214 @@ DATABASE_URL = os.environ.get(
     'postgresql://neondb_owner:npg_3FJeskp5EoVg@ep-polished-sky-ayuedb1p-pooler.c-5.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require'
 )
 
-def debug_health_pipeline():
-    """Debug what the Health pipeline is using"""
+def debug_all_pipelines():
+    """Debug ALL pipelines configuration"""
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
         print("\n" + "="*70)
-        print("🔍 HEALTH PIPELINE DEBUG")
+        print("🔍 ALL PIPELINES DEBUG")
         print("="*70)
         
-        # 1. Check auto_config for Health
-        print("\n📋 1. AUTO_CONFIG (Health pipeline settings):")
+        # 1. Get ALL auto_configs
+        print("\n📋 1. ALL AUTO_CONFIGS:")
         cur.execute("""
             SELECT * FROM auto_config 
-            WHERE name = 'Health'
+            ORDER BY name
         """)
-        health_config = cur.fetchone()
+        all_configs = cur.fetchall()
         
-        if health_config:
-            print(f"   Name: {health_config.get('name')}")
-            print(f"   Enabled: {health_config.get('enabled')}")
-            print(f"   Account Username: '{health_config.get('account_username')}'")
-            print(f"   Account ID: '{health_config.get('account_id')}'")
-            print(f"   Source Handles: {health_config.get('source_handles')}")
-            print(f"   Max Posts: {health_config.get('max_posts_per_run')}")
-            print(f"   Last Result: {health_config.get('last_result')}")
-            print(f"   Last Error: {health_config.get('last_error')}")
+        if not all_configs:
+            print("   ❌ No pipelines found in auto_config!")
         else:
-            print("   ❌ Health pipeline not found in auto_config!")
+            print(f"   Found {len(all_configs)} pipeline(s)\n")
+            
+            for cfg in all_configs:
+                print(f"   {'='*50}")
+                print(f"   📌 PIPELINE: {cfg.get('name')}")
+                print(f"      Enabled: {'🟢 YES' if cfg.get('enabled') else '🔴 NO'}")
+                print(f"      Account Username: '{cfg.get('account_username')}'")
+                print(f"      Account ID: '{cfg.get('account_id')}'")
+                print(f"      Source Handles: {cfg.get('source_handles')}")
+                print(f"      Niche: {cfg.get('niche')}")
+                print(f"      Max Posts: {cfg.get('max_posts_per_run')}")
+                print(f"      Content Type: {cfg.get('content_type')}")
+                print(f"      Media Only: {cfg.get('media_only')}")
+                print(f"      Include Reposts: {cfg.get('include_reposts')}")
+                print(f"      Last Run: {cfg.get('last_run_at')}")
+                print(f"      Last Result: {cfg.get('last_result')}")
+                print(f"      Last Error: {cfg.get('last_error')}")
+                print(f"      Updated: {cfg.get('updated_at')}")
         
-        # 2. Check zernio_accounts for Global Health Hub
-        print("\n📋 2. ZERNIO_ACCOUNTS (Global Health Hub):")
+        # 2. Get ALL Zernio accounts
+        print("\n" + "="*70)
+        print("📋 2. ALL ZERNIO ACCOUNTS:")
         cur.execute("""
-            SELECT account_id, username, display_name, api_key, is_active 
+            SELECT account_id, platform, username, display_name, is_active, api_key
             FROM zernio_accounts 
-            WHERE LOWER(TRIM(display_name)) LIKE '%global health hub%' 
-               OR LOWER(TRIM(username)) LIKE '%global health hub%'
-            ORDER BY is_active DESC
-        """)
-        health_accounts = cur.fetchall()
-        
-        if health_accounts:
-            for acc in health_accounts:
-                print(f"   Account ID: {acc.get('account_id')}")
-                print(f"   Username: '{acc.get('username')}'")
-                print(f"   Display Name: '{acc.get('display_name')}'")
-                print(f"   Is Active: {acc.get('is_active')}")
-                print(f"   API Key: {acc.get('api_key')[:20]}..." if acc.get('api_key') else "   API Key: None")
-                print("   ---")
-        else:
-            print("   ❌ Global Health Hub not found in zernio_accounts!")
-        
-        # 3. Check all Facebook accounts
-        print("\n📋 3. ALL FACEBOOK ACCOUNTS:")
-        cur.execute("""
-            SELECT account_id, username, display_name, is_active 
-            FROM zernio_accounts 
-            WHERE platform = 'facebook' 
-            ORDER BY is_active DESC, display_name
+            ORDER BY platform, display_name
         """)
         all_accounts = cur.fetchall()
         
-        if all_accounts:
-            for i, acc in enumerate(all_accounts, 1):
-                status = "🟢" if acc.get('is_active') else "🔴"
-                print(f"   {i}. {status} {acc.get('display_name')} (@{acc.get('username')})")
-                print(f"      ID: {acc.get('account_id')}")
+        if not all_accounts:
+            print("   ❌ No Zernio accounts found!")
         else:
-            print("   ❌ No Facebook accounts found!")
+            print(f"   Found {len(all_accounts)} Zernio account(s)\n")
+            for acc in all_accounts:
+                status = "🟢 ACTIVE" if acc.get('is_active') else "🔴 INACTIVE"
+                platform = acc.get('platform', 'unknown')
+                print(f"   📱 {platform.upper()}: {acc.get('display_name')} (@{acc.get('username')})")
+                print(f"      Account ID: {acc.get('account_id')}")
+                print(f"      Status: {status}")
+                if acc.get('api_key'):
+                    print(f"      API Key: {acc.get('api_key')[:20]}...")
+                print("")
         
-        # 4. Check if account_id in Health matches any zernio_account
-        print("\n📋 4. ACCOUNT ID MATCH CHECK:")
-        health_account_id = health_config.get('account_id') if health_config else None
+        # 3. Match pipelines to accounts
+        print("\n" + "="*70)
+        print("📋 3. PIPELINE TO ACCOUNT MAPPING:")
         
-        if health_account_id:
-            cur.execute("""
-                SELECT account_id, username, display_name, is_active 
-                FROM zernio_accounts 
-                WHERE account_id = %s AND platform = 'facebook'
-            """, (health_account_id,))
-            match = cur.fetchone()
+        for cfg in all_configs:
+            name = cfg.get('name')
+            account_id = cfg.get('account_id')
+            account_username = cfg.get('account_username')
             
-            if match:
-                print(f"   ✅ Health's account_id matches:")
-                print(f"      Display Name: {match.get('display_name')}")
-                print(f"      Username: {match.get('username')}")
-                print(f"      Is Active: {match.get('is_active')}")
+            print(f"\n   📌 {name}:")
+            
+            if account_id:
+                # Check if account exists
+                cur.execute("""
+                    SELECT platform, username, display_name, is_active 
+                    FROM zernio_accounts 
+                    WHERE account_id = %s
+                """, (account_id,))
+                match = cur.fetchone()
+                
+                if match:
+                    print(f"      ✅ Account found: {match.get('display_name')} (@{match.get('username')}) - {match.get('platform').upper()}")
+                    print(f"      Status: {'🟢 ACTIVE' if match.get('is_active') else '🔴 INACTIVE'}")
+                else:
+                    print(f"      ❌ Account ID '{account_id}' NOT FOUND in zernio_accounts!")
+            elif account_username:
+                # Try to find by username
+                cur.execute("""
+                    SELECT account_id, platform, username, display_name, is_active 
+                    FROM zernio_accounts 
+                    WHERE LOWER(username) = LOWER(%s) OR LOWER(display_name) = LOWER(%s)
+                """, (account_username, account_username))
+                match = cur.fetchone()
+                
+                if match:
+                    print(f"      ✅ Found by username: {match.get('display_name')} (@{match.get('username')}) - {match.get('platform').upper()}")
+                    print(f"      Account ID: {match.get('account_id')}")
+                    print(f"      Status: {'🟢 ACTIVE' if match.get('is_active') else '🔴 INACTIVE'}")
+                    print(f"      ⚠️ Pipeline has username but not account_id - consider updating with account_id")
+                else:
+                    print(f"      ⚠️ Username '{account_username}' not found in zernio_accounts!")
             else:
-                print(f"   ❌ Health's account_id '{health_account_id}' does NOT match any active Facebook account!")
-                print(f"   ⚠️ This is likely the problem - Health is trying to post to an invalid account!")
+                print(f"      ⚠️ No account configured!")
+        
+        # 4. Count posts per pipeline
+        print("\n" + "="*70)
+        print("📋 4. VAULT STATS PER PIPELINE:")
+        
+        for cfg in all_configs:
+            name = cfg.get('name')
+            
+            # Total posts
+            cur.execute("""
+                SELECT COUNT(*) as total FROM vault WHERE handler_handle = %s
+            """, (name,))
+            total = cur.fetchone()['total']
+            
+            # Unposted posts
+            cur.execute("""
+                SELECT COUNT(*) as unposted FROM vault v
+                WHERE v.handler_handle = %s
+                AND NOT EXISTS (
+                    SELECT 1 FROM posted_posts p
+                    WHERE p.uri = v.uri AND p.status IN ('completed', 'posted', 'duplicate')
+                )
+            """, (name,))
+            unposted = cur.fetchone()['unposted']
+            
+            # Posted posts
+            cur.execute("""
+                SELECT COUNT(*) as posted FROM vault v
+                WHERE v.handler_handle = %s
+                AND EXISTS (
+                    SELECT 1 FROM posted_posts p
+                    WHERE p.uri = v.uri AND p.status IN ('completed', 'posted')
+                )
+            """, (name,))
+            posted = cur.fetchone()['posted']
+            
+            print(f"\n   📌 {name}:")
+            print(f"      Total: {total} posts")
+            print(f"      Unposted: {unposted} posts")
+            print(f"      Posted: {posted} posts")
+            
+            if unposted > 0 and cfg.get('enabled') and cfg.get('account_id'):
+                print(f"      ✅ Ready to post {unposted} posts to {cfg.get('account_username')}")
+            elif unposted > 0 and not cfg.get('enabled'):
+                print(f"      ⚠️ {unposted} posts available but pipeline is DISABLED")
+            elif unposted > 0 and not cfg.get('account_id'):
+                print(f"      ⚠️ {unposted} posts available but NO ACCOUNT CONFIGURED")
+            else:
+                print(f"      ℹ️ No posts available")
+        
+        # 5. Check for orphaned accounts
+        print("\n" + "="*70)
+        print("📋 5. ORPHANED ACCOUNTS (in zernio_accounts but not used by any pipeline):")
+        
+        # Get all account IDs used by pipelines
+        used_account_ids = set()
+        for cfg in all_configs:
+            if cfg.get('account_id'):
+                used_account_ids.add(cfg.get('account_id'))
+        
+        cur.execute("""
+            SELECT account_id, platform, username, display_name, is_active
+            FROM zernio_accounts
+            WHERE is_active = TRUE
+        """)
+        all_active = cur.fetchall()
+        
+        orphans = [acc for acc in all_active if acc.get('account_id') not in used_account_ids]
+        
+        if orphans:
+            print(f"   Found {len(orphans)} orphaned account(s):")
+            for acc in orphans:
+                print(f"      📱 {acc.get('display_name')} (@{acc.get('username')}) - {acc.get('platform').upper()}")
+                print(f"         Account ID: {acc.get('account_id')}")
         else:
-            print("   ⚠️ Health has no account_id set!")
+            print("   ✅ All active accounts are being used by pipelines!")
         
-        # 5. Check what's in posted_posts for Health
-        print("\n📋 5. RECENT POSTED POSTS (Health):")
-        cur.execute("""
-            SELECT p.id, p.vault_id, p.status, p.platform_post_id, p.posted_at, 
-                   v.text, v.uri
-            FROM posted_posts p
-            LEFT JOIN vault v ON v.id = p.vault_id
-            WHERE p.platform = 'facebook'
-            ORDER BY p.posted_at DESC
-            LIMIT 10
-        """)
-        recent_posts = cur.fetchall()
+        # 6. Check cron status
+        print("\n" + "="*70)
+        print("📋 6. CRON STATUS:")
+        cur.execute("SELECT value FROM app_settings WHERE key = 'cron_enabled'")
+        row = cur.fetchone()
         
-        if recent_posts:
-            for p in recent_posts:
-                status = p.get('status')
-                status_icon = "✅" if status == 'posted' else "⚠️" if status == 'duplicate' else "❌"
-                text = (p.get('text') or '')[:50]
-                print(f"   {status_icon} #{p.get('vault_id')} {status}: {text}...")
+        if row:
+            cron_enabled = row['value'].lower() == 'true'
+            print(f"   Cron State: {'🟢 ENABLED' if cron_enabled else '🔴 DISABLED'}")
         else:
-            print("   No recent posts found")
+            print("   ⚠️ Cron state not set (default: ENABLED)")
         
-        # 6. Count Health's unposted posts
-        print("\n📋 6. HEALTH VAULT STATS:")
-        cur.execute("""
-            SELECT COUNT(*) as total FROM vault WHERE handler_handle = 'Health'
-        """)
-        total = cur.fetchone()['total']
+        # 7. Check for errors
+        print("\n" + "="*70)
+        print("📋 7. ERROR SUMMARY:")
         
-        cur.execute("""
-            SELECT COUNT(*) as unposted FROM vault v
-            WHERE v.handler_handle = 'Health'
-            AND NOT EXISTS (
-                SELECT 1 FROM posted_posts p
-                WHERE p.uri = v.uri AND p.platform = 'facebook'
-                  AND p.status IN ('completed', 'posted', 'duplicate')
-            )
-        """)
-        unposted = cur.fetchone()['unposted']
+        has_errors = False
+        for cfg in all_configs:
+            if cfg.get('last_error'):
+                has_errors = True
+                print(f"   ❌ {cfg.get('name')}: {cfg.get('last_error')}")
         
-        print(f"   Total posts in Health vault: {total}")
-        print(f"   Unposted posts: {unposted}")
-        
-        # 7. Show a sample of Health's vault posts
-        print("\n📋 7. SAMPLE HEALTH VAULT POSTS:")
-        cur.execute("""
-            SELECT id, text, images, created_at, saved_at
-            FROM vault
-            WHERE handler_handle = 'Health'
-            ORDER BY saved_at DESC
-            LIMIT 5
-        """)
-        samples = cur.fetchall()
-        
-        if samples:
-            for s in samples:
-                text = (s.get('text') or '')[:60]
-                images = s.get('images')
-                if isinstance(images, str):
-                    try:
-                        images = json.loads(images)
-                    except:
-                        pass
-                img_count = len(images) if isinstance(images, list) else 0
-                img_preview = ""
-                if images and isinstance(images, list) and len(images) > 0:
-                    first = images[0]
-                    if isinstance(first, dict):
-                        img_preview = first.get('url', '')[:60]
-                    else:
-                        img_preview = str(first)[:60]
-                print(f"   #{s.get('id')}: {text[:40]}...")
-                print(f"      Images: {img_count} | First: {img_preview}")
-        else:
-            print("   No posts in Health vault")
+        if not has_errors:
+            print("   ✅ No errors found in any pipeline")
         
         cur.close()
         conn.close()
@@ -196,4 +237,4 @@ def debug_health_pipeline():
 
 # Run the debug
 if __name__ == "__main__":
-    debug_health_pipeline()
+    debug_all_pipelines()
