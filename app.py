@@ -2856,108 +2856,136 @@ def _run_one_pipeline(cfg):
             if conn:
                 cur = conn.cursor(cursor_factory=RealDictCursor)
 
-                # Fetch MORE posts than needed (3x) to handle duplicates/failures
-                fetch_limit = remaining * 3
-                print(f"   🔍 Fetching up to {fetch_limit} reserve posts (3x needed)")
-
-                # UPDATED RESERVE QUERY - Skips external links, recently failed
-                # posts, AND permanently-duplicate posts (409 from Zernio).
-                cur.execute("""
-                    SELECT v.* FROM vault v
-                    WHERE v.handler_handle = %s
-                    AND NOT EXISTS (
-                        SELECT 1 FROM posted_posts p
-                        WHERE p.uri = v.uri AND p.platform = 'facebook'
-                          AND p.status IN ('completed', 'posted', 'duplicate')
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1 FROM auto_seen s
-                        WHERE s.config_name = %s AND s.uri = v.uri 
-                        AND s.posted = FALSE 
-                        AND s.seen_at > NOW() - INTERVAL '10 minutes'
-                    )
-                    -- Skip external links that aren't valid images
-                    AND (
-                        v.images IS NULL 
-                        OR (
-                            v.images::text NOT LIKE '%%youtube.com%%'
-                            AND v.images::text NOT LIKE '%%facebook.com%%'
-                            AND v.images::text NOT LIKE '%%reel%%'
-                            AND v.images::text NOT LIKE '%%shorts%%'
-                            AND v.images::text NOT LIKE '%%tiktok.com%%'
-                            AND v.images::text NOT LIKE '%%instagram.com%%'
-                            AND v.images::text NOT LIKE '%%twitter.com%%'
-                            AND v.images::text NOT LIKE '%%x.com%%'
-                            AND v.images::text NOT LIKE '%%vimeo.com%%'
-                            AND v.images::text NOT LIKE '%%dailymotion.com%%'
+                # Keep fetching in batches until we post enough or run out of posts
+                offset = 0
+                batch_size = remaining * 3  # Get 3x what we need per batch
+                max_batches = 10  # Safety limit to prevent infinite loops
+                batch_count = 0
+                total_checked = 0
+                
+                while posted_from_reserve < remaining and batch_count < max_batches:
+                    batch_count += 1
+                    print(f"   🔍 Batch {batch_count}: Fetching up to {batch_size} reserve posts (offset {offset})")
+                    
+                    # Query with OFFSET to get next batch
+                    cur.execute("""
+                        SELECT v.* FROM vault v
+                        WHERE v.handler_handle = %s
+                        AND NOT EXISTS (
+                            SELECT 1 FROM posted_posts p
+                            WHERE p.uri = v.uri AND p.platform = 'facebook'
+                              AND p.status IN ('completed', 'posted', 'duplicate')
                         )
-                    )
-                    ORDER BY v.saved_at ASC
-                    LIMIT %s
-                """, (name, name, fetch_limit))
-
-                reserve = cur.fetchall()
-                print(f"   📦 Found {len(reserve)} unposted posts in reserve")
-
+                        AND NOT EXISTS (
+                            SELECT 1 FROM auto_seen s
+                            WHERE s.config_name = %s AND s.uri = v.uri 
+                            AND s.posted = FALSE 
+                            AND s.seen_at > NOW() - INTERVAL '10 minutes'
+                        )
+                        -- Skip external links that aren't valid images
+                        AND (
+                            v.images IS NULL 
+                            OR (
+                                v.images::text NOT LIKE '%%youtube.com%%'
+                                AND v.images::text NOT LIKE '%%facebook.com%%'
+                                AND v.images::text NOT LIKE '%%reel%%'
+                                AND v.images::text NOT LIKE '%%shorts%%'
+                                AND v.images::text NOT LIKE '%%tiktok.com%%'
+                                AND v.images::text NOT LIKE '%%instagram.com%%'
+                                AND v.images::text NOT LIKE '%%twitter.com%%'
+                                AND v.images::text NOT LIKE '%%x.com%%'
+                                AND v.images::text NOT LIKE '%%vimeo.com%%'
+                                AND v.images::text NOT LIKE '%%dailymotion.com%%'
+                            )
+                        )
+                        ORDER BY v.saved_at ASC
+                        LIMIT %s OFFSET %s
+                    """, (name, name, batch_size, offset))
+                    
+                    reserve = cur.fetchall()
+                    total_checked += len(reserve)
+                    print(f"   📦 Found {len(reserve)} unposted posts in this batch (total checked: {total_checked})")
+                    
+                    # If no more posts, break out
+                    if not reserve:
+                        print(f"   📭 No more unposted posts in vault")
+                        break
+                    
+                    # Process this batch
+                    batch_posts_processed = 0
+                    for item in reserve:
+                        # Check if we've posted enough
+                        if posted_from_reserve >= remaining:
+                            print(f"   ✅ Reached target of {remaining} posts, stopping")
+                            break
+                        
+                        # Check if the image is actually a valid image URL
+                        images = item.get('images') or []
+                        if isinstance(images, str):
+                            try:
+                                images = json.loads(images)
+                            except Exception:
+                                images = []
+                        
+                        image_url = None
+                        if images:
+                            first = images[0]
+                            if isinstance(first, dict):
+                                image_url = first.get('url')
+                            else:
+                                image_url = first
+                        
+                        # Skip if it's an external link (double-check)
+                        if image_url:
+                            external_domains = ['youtube.com', 'facebook.com', 'reel', 'shorts', 
+                                              'tiktok.com', 'instagram.com', 'twitter.com', 
+                                              'x.com', 'vimeo.com', 'dailymotion.com']
+                            if any(domain in image_url.lower() for domain in external_domains):
+                                print(f"   ⏭️ Skipping external link: {image_url[:60]}...")
+                                _mark_seen(name, item.get('uri'), posted=False)
+                                batch_posts_processed += 1
+                                continue
+                        
+                        print(f"   📤 Attempting reserve post: vault #{item['id']} - {item.get('text', '')[:40]}...")
+                        
+                        res = tool_post_now(
+                            vault_id=item['id'],
+                            account_username=account_username,
+                            account_id=account_id,
+                            content_type=content_type,
+                        )
+                        
+                        print(f"      Result: success={res.get('success')}")
+                        if not res.get('success'):
+                            print(f"      Error: {res.get('error') or res.get('message')}")
+                        
+                        if res.get('success'):
+                            posted_from_reserve += 1
+                            _mark_seen(name, item.get('uri'), posted=True)
+                            print(f"   ✅ Posted {posted_from_reserve}/{remaining} reserve posts")
+                        else:
+                            # Mark as seen with posted=False so it won't be retried immediately
+                            _mark_seen(name, item.get('uri'), posted=False)
+                            print(f"   ⏭️ Skipping failed post, continuing to next")
+                        
+                        batch_posts_processed += 1
+                    
+                    # Move offset forward
+                    offset += batch_size
+                    
+                    # If we processed fewer posts than batch_size, there might be more but we've hit limits
+                    if len(reserve) < batch_size:
+                        print(f"   📭 Reached end of available posts")
+                        break
+                    
+                    # If we haven't posted enough and have more posts to check, continue to next batch
+                    if posted_from_reserve < remaining:
+                        print(f"   🔄 Need {remaining - posted_from_reserve} more posts, fetching next batch...")
+                
                 cur.close()
                 conn.close()
-
-                # Loop through reserve until we post enough or run out
-                for item in reserve:
-                    # Check if we've posted enough
-                    if posted_from_reserve >= remaining:
-                        print(f"   ✅ Reached target of {remaining} posts, stopping")
-                        break
-
-                    # Check if the image is actually a valid image URL
-                    images = item.get('images') or []
-                    if isinstance(images, str):
-                        try:
-                            images = json.loads(images)
-                        except Exception:
-                            images = []
-
-                    image_url = None
-                    if images:
-                        first = images[0]
-                        if isinstance(first, dict):
-                            image_url = first.get('url')
-                        else:
-                            image_url = first
-
-                    # Skip if it's an external link (double-check)
-                    if image_url:
-                        external_domains = ['youtube.com', 'facebook.com', 'reel', 'shorts', 
-                                          'tiktok.com', 'instagram.com', 'twitter.com', 
-                                          'x.com', 'vimeo.com', 'dailymotion.com']
-                        if any(domain in image_url.lower() for domain in external_domains):
-                            print(f"   ⏭️ Skipping external link: {image_url[:60]}...")
-                            _mark_seen(name, item.get('uri'), posted=False)
-                            continue
-
-                    print(f"   📤 Attempting reserve post: vault #{item['id']} - {item.get('text', '')[:40]}...")
-
-                    res = tool_post_now(
-                        vault_id=item['id'],
-                        account_username=account_username,
-                        account_id=account_id,
-                        content_type=content_type,
-                    )
-
-                    print(f"      Result: success={res.get('success')}")
-                    if not res.get('success'):
-                        print(f"      Error: {res.get('error') or res.get('message')}")
-
-                    if res.get('success'):
-                        posted_from_reserve += 1
-                        _mark_seen(name, item.get('uri'), posted=True)
-                        print(f"   ✅ Posted {posted_from_reserve}/{remaining} reserve posts")
-                    else:
-                        # Mark as seen with posted=False so it won't be retried immediately
-                        _mark_seen(name, item.get('uri'), posted=False)
-                        print(f"   ⏭️ Skipping failed post, continuing to next")
-
-                print(f"   📊 Final reserve posts posted: {posted_from_reserve}/{remaining}")
+                
+                print(f"   📊 Final reserve posts posted: {posted_from_reserve}/{remaining} after {batch_count} batch(es) ({total_checked} posts checked)")
         except Exception as e:
             print(f"   ❌ Reserve query error: {e}")
             traceback.print_exc()
