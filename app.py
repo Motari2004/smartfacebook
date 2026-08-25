@@ -2728,8 +2728,19 @@ def _run_one_pipeline(cfg):
     content_type = cfg.get('content_type') or 'feed'
     can_post = bool(account_username or account_id)
 
+    # Debug logging
+    print(f"\n{'='*60}")
+    print(f"🔍 PIPELINE DEBUG: {name}")
+    print(f"   Enabled: {cfg.get('enabled')}")
+    print(f"   Sources: {sources}")
+    print(f"   Account: {account_username or account_id or 'NONE'}")
+    print(f"   Max posts: {max_posts}")
+    print(f"   Media only: {media_only}")
+    print(f"   Can post: {can_post}")
+    print(f"{'='*60}")
+
     if not can_post:
-        print(f"Pipeline {name}: no FB destination — fetch only into vault")
+        print(f"⚠️ Pipeline {name}: no FB destination — fetch only into vault")
 
     # ---------- 1) NEW posts from Bluesky ----------
     posted_new = 0
@@ -2741,6 +2752,7 @@ def _run_one_pipeline(cfg):
                 actor = src.lstrip('@')
                 if '.' not in actor:
                     actor = actor + '.bsky.social'
+                print(f"   📡 Fetching from @{actor}")
                 for p in _raw_get_author_feed(client, actor, limit=40, max_pages=3):
                     if not include_reposts and p.get('is_repost'):
                         continue
@@ -2762,13 +2774,16 @@ def _run_one_pipeline(cfg):
                         "created_at": p.get('created_at'),
                     })
             except Exception as e:
-                print(f"fetch {src}: {e}")
+                print(f"   ❌ fetch {src}: {e}")
+
+        print(f"   📊 Fetched {len(fetched_posts)} new posts")
 
         if fetched_posts:
             tool_add_to_vault(fetched_posts, handler_handle=name)
 
         if can_post:
             for p in fetched_posts[:max_posts]:
+                print(f"   📤 Attempting new post: {p.get('uri')[:50]}...")
                 _mark_seen(name, p['uri'], posted=False)
                 try:
                     conn = get_db_connection()
@@ -2787,24 +2802,37 @@ def _run_one_pipeline(cfg):
                         account_id=account_id,
                         content_type=content_type,
                     )
+                    print(f"      Result: success={res.get('success')}")
+                    if not res.get('success'):
+                        print(f"      Error: {res.get('error') or res.get('message')}")
                     if res.get('success'):
                         posted_new += 1
                         _mark_seen(name, p['uri'], posted=True)
+                    else:
+                        # Mark as seen with posted=False to avoid immediate retry
+                        _mark_seen(name, p['uri'], posted=False)
+                else:
+                    print(f"      ⚠️ Vault item not found for URI")
         else:
             for p in fetched_posts:
                 if p.get('uri'):
                     _mark_seen(name, p['uri'], posted=False)
     else:
-        print(f"Pipeline {name}: no Bluesky session — will use vault reserve only")
+        print(f"⚠️ Pipeline {name}: no Bluesky session — will use vault reserve only")
 
     # ---------- 2) Fill from vault reserve if not enough new ----------
     posted_from_reserve = 0
     remaining = max(0, max_posts - posted_new)
+    print(f"   📊 New posts: {posted_new}, Remaining slots: {remaining}")
+
     if can_post and remaining > 0:
+        print(f"   🔍 Checking reserve for {name} (need {remaining} posts)")
         try:
             conn = get_db_connection()
             if conn:
                 cur = conn.cursor(cursor_factory=RealDictCursor)
+                
+                # UPDATED RESERVE QUERY - Skips external links and recently failed posts
                 cur.execute("""
                     SELECT v.* FROM vault v
                     WHERE v.handler_handle = %s
@@ -2813,36 +2841,108 @@ def _run_one_pipeline(cfg):
                         WHERE p.uri = v.uri AND p.platform = 'facebook'
                           AND p.status IN ('completed', 'posted')
                     )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM auto_seen s
+                        WHERE s.config_name = %s AND s.uri = v.uri 
+                        AND s.posted = FALSE 
+                        AND s.seen_at > NOW() - INTERVAL '10 minutes'
+                    )
+                    -- Skip external links that aren't valid images
+                    AND (
+                        v.images IS NULL 
+                        OR (
+                            v.images::text NOT LIKE '%youtube.com%'
+                            AND v.images::text NOT LIKE '%facebook.com%'
+                            AND v.images::text NOT LIKE '%reel%'
+                            AND v.images::text NOT LIKE '%shorts%'
+                            AND v.images::text NOT LIKE '%tiktok.com%'
+                            AND v.images::text NOT LIKE '%instagram.com%'
+                            AND v.images::text NOT LIKE '%twitter.com%'
+                            AND v.images::text NOT LIKE '%x.com%'
+                            AND v.images::text NOT LIKE '%vimeo.com%'
+                            AND v.images::text NOT LIKE '%dailymotion.com%'
+                        )
+                    )
                     ORDER BY v.saved_at ASC
                     LIMIT %s
-                """, (name, remaining))
+                """, (name, name, remaining))
+                
                 reserve = cur.fetchall()
+                print(f"   📦 Found {len(reserve)} unposted posts in reserve")
+                
                 cur.close()
                 conn.close()
+
                 for item in reserve:
+                    # Check if the image is actually a valid image URL
+                    images = item.get('images') or []
+                    if isinstance(images, str):
+                        try:
+                            images = json.loads(images)
+                        except Exception:
+                            images = []
+                    
+                    image_url = None
+                    if images:
+                        first = images[0]
+                        if isinstance(first, dict):
+                            image_url = first.get('url')
+                        else:
+                            image_url = first
+                    
+                    # Skip if it's an external link (double-check)
+                    if image_url:
+                        external_domains = ['youtube.com', 'facebook.com', 'reel', 'shorts', 
+                                          'tiktok.com', 'instagram.com', 'twitter.com', 
+                                          'x.com', 'vimeo.com', 'dailymotion.com']
+                        if any(domain in image_url.lower() for domain in external_domains):
+                            print(f"   ⏭️ Skipping external link: {image_url[:60]}...")
+                            _mark_seen(name, item.get('uri'), posted=False)
+                            continue
+                    
+                    print(f"   📤 Attempting reserve post: vault #{item['id']} - {item.get('text', '')[:40]}...")
+                    
                     res = tool_post_now(
                         vault_id=item['id'],
                         account_username=account_username,
                         account_id=account_id,
                         content_type=content_type,
                     )
+                    
+                    print(f"      Result: success={res.get('success')}")
+                    if not res.get('success'):
+                        print(f"      Error: {res.get('error') or res.get('message')}")
+                    
                     if res.get('success'):
                         posted_from_reserve += 1
                         _mark_seen(name, item.get('uri'), posted=True)
+                    else:
+                        # Mark as seen with posted=False so it won't be retried immediately
+                        _mark_seen(name, item.get('uri'), posted=False)
         except Exception as e:
-            print(f"reserve post: {e}")
+            print(f"   ❌ Reserve query error: {e}")
+            traceback.print_exc()
 
     total = posted_new + posted_from_reserve
+    
+    # Summary
+    print(f"\n📊 Pipeline {name} summary:")
+    print(f"   New posts: {posted_new}")
+    print(f"   Reserve posts: {posted_from_reserve}")
+    print(f"   Total: {total}/{max_posts}")
+    print(f"{'='*60}\n")
+
     if can_post:
         msg = f"Posted {total} (new={posted_new}, reserve={posted_from_reserve})"
         cfg['last_error'] = None
     else:
-        # No destination yet: still useful — fill vault only
-        msg = f"Fetched {len(fetched_posts)} into vault"
+        msg = f"Fetched {len(fetched_posts)} into vault (no destination)"
         cfg['last_error'] = None
+    
     cfg['last_result'] = msg
     cfg['last_run_at'] = datetime.now()
     _save_auto_config(cfg)
+    
     print(f"🤖 Pipeline {name}: {msg}")
     return {"success": True, "posted": total, "message": msg}
 
