@@ -1229,56 +1229,11 @@ def create_facebook_post(text, account_id, media_urls=None, scheduled_for=None,
 
 
 def get_facebook_account_id(account_id=None, account_username=None):
-    if account_id:
-        return account_id
-    if account_username:
-        conn = get_db_connection()
-        if conn:
-            try:
-                cur = conn.cursor()
-                cur.execute("""
-                    SELECT account_id FROM zernio_accounts
-                    WHERE username = %s AND platform = 'facebook' AND is_active = TRUE
-                    LIMIT 1
-                """, (account_username,))
-                row = cur.fetchone()
-                cur.close()
-                conn.close()
-                if row:
-                    return row[0]
-            except Exception as e:
-                print(f"resolve username: {e}")
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-    conn = get_db_connection()
-    if conn:
-        try:
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT account_id FROM zernio_accounts
-                WHERE platform = 'facebook' AND is_active = TRUE
-                ORDER BY last_sync DESC NULLS LAST, created_at DESC
-                LIMIT 1
-            """)
-            row = cur.fetchone()
-            cur.close()
-            conn.close()
-            if row:
-                return row[0]
-        except Exception as e:
-            print(f"get first facebook: {e}")
-            try:
-                conn.close()
-            except Exception:
-                pass
-    accounts = refresh_all_zernio_accounts()
-    for acc in accounts:
-        aid = acc.get('account_id') or acc.get('_id')
-        if aid:
-            return aid
-    return None
+    """
+    Get Facebook account ID - uses resolve_facebook_account_id for consistent resolution.
+    This is a wrapper for compatibility.
+    """
+    return resolve_facebook_account_id(account_id, account_username)
 
 
 def resolve_facebook_account_id(account_id=None, account_username=None):
@@ -2632,18 +2587,27 @@ def tool_auto_set_destination(name, account_username=None, account_id=None):
         return {"success": False, "error": f"Pipeline '{name}' not found"}
     if not account_username and not account_id:
         return {"success": False, "error": "account_username or account_id required"}
+    
+    # If account_username is provided but no account_id, resolve it
     if account_username and not account_id:
-        account_id = get_facebook_account_id(account_username=account_username)
+        # Use resolve_facebook_account_id directly (bypass get_facebook_account_id)
+        account_id = resolve_facebook_account_id(account_username=account_username)
+        if not account_id:
+            return {"success": False, "error": f"Could not resolve account: {account_username}"}
+    
+    # Store BOTH the username and the ID
     cfg['account_username'] = account_username or cfg.get('account_username')
     cfg['account_id'] = account_id or cfg.get('account_id')
-    cfg['last_result'] = f"destination set → @{cfg.get('account_username') or cfg.get('account_id')}"
+    cfg['last_result'] = f"destination set → @{cfg.get('account_username') or cfg.get('account_id')} (ID: {cfg.get('account_id')})"
+    
     if not _save_auto_config(cfg):
         return {"success": False, "error": "Failed to save"}
+    
     return {
         "success": True,
         "message": (
             f"✅ Pipeline '{resolved}' destination: "
-            f"Facebook @{cfg.get('account_username') or cfg.get('account_id')}"
+            f"Facebook @{cfg.get('account_username') or cfg.get('account_id')} (ID: {cfg.get('account_id')})"
         ),
         "config": cfg,
     }
