@@ -1282,7 +1282,82 @@ def get_facebook_account_id(account_id=None, account_username=None):
 
 
 def resolve_facebook_account_id(account_id=None, account_username=None):
-    return get_facebook_account_id(account_id, account_username)
+    """
+    Resolve Facebook account ID - uses account_id directly if provided,
+    otherwise looks up by username in the database.
+    """
+    # If account_id is provided, use it directly (DON'T query the database)
+    if account_id:
+        print(f"🔍 Using direct account_id: {account_id}")
+        return account_id
+    
+    if account_username:
+        clean_username = account_username.strip()
+        print(f"🔍 Looking up account by username: '{clean_username}'")
+        
+        conn = get_db_connection()
+        if conn:
+            try:
+                cur = conn.cursor()
+                
+                # Try exact match on username (trimmed, case-insensitive)
+                cur.execute("""
+                    SELECT account_id FROM zernio_accounts
+                    WHERE LOWER(TRIM(username)) = LOWER(%s) 
+                    AND platform = 'facebook' AND is_active = TRUE
+                    LIMIT 1
+                """, (clean_username,))
+                row = cur.fetchone()
+                if row:
+                    result = row[0]
+                    cur.close()
+                    conn.close()
+                    print(f"✅ Found account by username: {result}")
+                    return result
+                
+                # Try display_name match (trimmed, case-insensitive)
+                cur.execute("""
+                    SELECT account_id FROM zernio_accounts
+                    WHERE LOWER(TRIM(display_name)) = LOWER(%s) 
+                    AND platform = 'facebook' AND is_active = TRUE
+                    LIMIT 1
+                """, (clean_username,))
+                row = cur.fetchone()
+                if row:
+                    result = row[0]
+                    cur.close()
+                    conn.close()
+                    print(f"✅ Found account by display_name: {result}")
+                    return result
+                
+                # Try fuzzy match on display_name
+                cur.execute("""
+                    SELECT account_id FROM zernio_accounts
+                    WHERE LOWER(TRIM(display_name)) LIKE LOWER(%s) 
+                    AND platform = 'facebook' AND is_active = TRUE
+                    LIMIT 1
+                """, (f"%{clean_username}%",))
+                row = cur.fetchone()
+                if row:
+                    result = row[0]
+                    cur.close()
+                    conn.close()
+                    print(f"✅ Found account by fuzzy match: {result}")
+                    return result
+                
+                cur.close()
+                conn.close()
+                print(f"⚠️ No account found for username: '{clean_username}'")
+            except Exception as e:
+                print(f"❌ resolve username error: {e}")
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    
+    # Fallback: DO NOT auto-pick the first account - return None
+    print(f"⚠️ Could not resolve account for: {account_id or account_username or 'None'}")
+    return None
 
 
 def post_to_facebook(image_url=None, image_bytes=None, caption="", account_id=None,
