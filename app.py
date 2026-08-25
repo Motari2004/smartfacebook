@@ -2809,7 +2809,6 @@ def _run_one_pipeline(cfg):
                         posted_new += 1
                         _mark_seen(name, p['uri'], posted=True)
                     else:
-                        # Mark as seen with posted=False to avoid immediate retry
                         _mark_seen(name, p['uri'], posted=False)
                 else:
                     print(f"      ⚠️ Vault item not found for URI")
@@ -2832,8 +2831,8 @@ def _run_one_pipeline(cfg):
             if conn:
                 cur = conn.cursor(cursor_factory=RealDictCursor)
                 
-                # UPDATED RESERVE QUERY - Skips external links and recently failed posts
-                cur.execute("""
+                # Build the query with all filters
+                query = """
                     SELECT v.* FROM vault v
                     WHERE v.handler_handle = %s
                     AND NOT EXISTS (
@@ -2841,31 +2840,44 @@ def _run_one_pipeline(cfg):
                         WHERE p.uri = v.uri AND p.platform = 'facebook'
                           AND p.status IN ('completed', 'posted')
                     )
+                """
+                params = [name]
+                
+                # Add auto_seen filter (skip recently failed posts)
+                query += """
                     AND NOT EXISTS (
                         SELECT 1 FROM auto_seen s
                         WHERE s.config_name = %s AND s.uri = v.uri 
                         AND s.posted = FALSE 
                         AND s.seen_at > NOW() - INTERVAL '10 minutes'
                     )
-                    -- Skip external links that aren't valid images
-                    AND (
-                        v.images IS NULL 
-                        OR (
-                            v.images::text NOT LIKE '%youtube.com%'
-                            AND v.images::text NOT LIKE '%facebook.com%'
-                            AND v.images::text NOT LIKE '%reel%'
-                            AND v.images::text NOT LIKE '%shorts%'
-                            AND v.images::text NOT LIKE '%tiktok.com%'
-                            AND v.images::text NOT LIKE '%instagram.com%'
-                            AND v.images::text NOT LIKE '%twitter.com%'
-                            AND v.images::text NOT LIKE '%x.com%'
-                            AND v.images::text NOT LIKE '%vimeo.com%'
-                            AND v.images::text NOT LIKE '%dailymotion.com%'
-                        )
-                    )
+                """
+                params.append(name)
+                
+                # Add external link filter (skip invalid image URLs)
+                query += """
+                    AND v.images IS NOT NULL
+                    AND v.images::text NOT LIKE '%youtube.com%'
+                    AND v.images::text NOT LIKE '%facebook.com%'
+                    AND v.images::text NOT LIKE '%reel%'
+                    AND v.images::text NOT LIKE '%shorts%'
+                    AND v.images::text NOT LIKE '%tiktok.com%'
+                    AND v.images::text NOT LIKE '%instagram.com%'
+                    AND v.images::text NOT LIKE '%twitter.com%'
+                    AND v.images::text NOT LIKE '%x.com%'
+                    AND v.images::text NOT LIKE '%vimeo.com%'
+                    AND v.images::text NOT LIKE '%dailymotion.com%'
+                """
+                
+                # Add order and limit
+                query += """
                     ORDER BY v.saved_at ASC
                     LIMIT %s
-                """, (name, name, remaining))
+                """
+                params.append(remaining)
+                
+                print(f"   🔍 Query params: {params}")
+                cur.execute(query, tuple(params))
                 
                 reserve = cur.fetchall()
                 print(f"   📦 Found {len(reserve)} unposted posts in reserve")
@@ -2874,7 +2886,7 @@ def _run_one_pipeline(cfg):
                 conn.close()
 
                 for item in reserve:
-                    # Check if the image is actually a valid image URL
+                    # Double-check image URL is valid
                     images = item.get('images') or []
                     if isinstance(images, str):
                         try:
@@ -2890,7 +2902,7 @@ def _run_one_pipeline(cfg):
                         else:
                             image_url = first
                     
-                    # Skip if it's an external link (double-check)
+                    # Skip external links (double-check)
                     if image_url:
                         external_domains = ['youtube.com', 'facebook.com', 'reel', 'shorts', 
                                           'tiktok.com', 'instagram.com', 'twitter.com', 
@@ -2917,7 +2929,6 @@ def _run_one_pipeline(cfg):
                         posted_from_reserve += 1
                         _mark_seen(name, item.get('uri'), posted=True)
                     else:
-                        # Mark as seen with posted=False so it won't be retried immediately
                         _mark_seen(name, item.get('uri'), posted=False)
         except Exception as e:
             print(f"   ❌ Reserve query error: {e}")
