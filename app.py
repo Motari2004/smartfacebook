@@ -2809,6 +2809,7 @@ def _run_one_pipeline(cfg):
                         posted_new += 1
                         _mark_seen(name, p['uri'], posted=True)
                     else:
+                        # Mark as seen with posted=False to avoid immediate retry
                         _mark_seen(name, p['uri'], posted=False)
                 else:
                     print(f"      ⚠️ Vault item not found for URI")
@@ -2830,9 +2831,10 @@ def _run_one_pipeline(cfg):
             conn = get_db_connection()
             if conn:
                 cur = conn.cursor(cursor_factory=RealDictCursor)
-                
-                # Build the query with all filters
-                query = """
+
+                # UPDATED RESERVE QUERY - Skips external links and recently failed posts
+                # NOTE: literal % in LIKE patterns must be escaped as %% for psycopg2
+                cur.execute("""
                     SELECT v.* FROM vault v
                     WHERE v.handler_handle = %s
                     AND NOT EXISTS (
@@ -2840,60 +2842,47 @@ def _run_one_pipeline(cfg):
                         WHERE p.uri = v.uri AND p.platform = 'facebook'
                           AND p.status IN ('completed', 'posted')
                     )
-                """
-                params = [name]
-                
-                # Add auto_seen filter (skip recently failed posts)
-                query += """
                     AND NOT EXISTS (
                         SELECT 1 FROM auto_seen s
                         WHERE s.config_name = %s AND s.uri = v.uri 
                         AND s.posted = FALSE 
                         AND s.seen_at > NOW() - INTERVAL '10 minutes'
                     )
-                """
-                params.append(name)
-                
-                # Add external link filter (skip invalid image URLs)
-                query += """
-                    AND v.images IS NOT NULL
-                    AND v.images::text NOT LIKE '%youtube.com%'
-                    AND v.images::text NOT LIKE '%facebook.com%'
-                    AND v.images::text NOT LIKE '%reel%'
-                    AND v.images::text NOT LIKE '%shorts%'
-                    AND v.images::text NOT LIKE '%tiktok.com%'
-                    AND v.images::text NOT LIKE '%instagram.com%'
-                    AND v.images::text NOT LIKE '%twitter.com%'
-                    AND v.images::text NOT LIKE '%x.com%'
-                    AND v.images::text NOT LIKE '%vimeo.com%'
-                    AND v.images::text NOT LIKE '%dailymotion.com%'
-                """
-                
-                # Add order and limit
-                query += """
+                    -- Skip external links that aren't valid images
+                    AND (
+                        v.images IS NULL 
+                        OR (
+                            v.images::text NOT LIKE '%%youtube.com%%'
+                            AND v.images::text NOT LIKE '%%facebook.com%%'
+                            AND v.images::text NOT LIKE '%%reel%%'
+                            AND v.images::text NOT LIKE '%%shorts%%'
+                            AND v.images::text NOT LIKE '%%tiktok.com%%'
+                            AND v.images::text NOT LIKE '%%instagram.com%%'
+                            AND v.images::text NOT LIKE '%%twitter.com%%'
+                            AND v.images::text NOT LIKE '%%x.com%%'
+                            AND v.images::text NOT LIKE '%%vimeo.com%%'
+                            AND v.images::text NOT LIKE '%%dailymotion.com%%'
+                        )
+                    )
                     ORDER BY v.saved_at ASC
                     LIMIT %s
-                """
-                params.append(remaining)
-                
-                print(f"   🔍 Query params: {params}")
-                cur.execute(query, tuple(params))
-                
+                """, (name, name, remaining))
+
                 reserve = cur.fetchall()
                 print(f"   📦 Found {len(reserve)} unposted posts in reserve")
-                
+
                 cur.close()
                 conn.close()
 
                 for item in reserve:
-                    # Double-check image URL is valid
+                    # Check if the image is actually a valid image URL
                     images = item.get('images') or []
                     if isinstance(images, str):
                         try:
                             images = json.loads(images)
                         except Exception:
                             images = []
-                    
+
                     image_url = None
                     if images:
                         first = images[0]
@@ -2901,8 +2890,8 @@ def _run_one_pipeline(cfg):
                             image_url = first.get('url')
                         else:
                             image_url = first
-                    
-                    # Skip external links (double-check)
+
+                    # Skip if it's an external link (double-check)
                     if image_url:
                         external_domains = ['youtube.com', 'facebook.com', 'reel', 'shorts', 
                                           'tiktok.com', 'instagram.com', 'twitter.com', 
@@ -2911,31 +2900,32 @@ def _run_one_pipeline(cfg):
                             print(f"   ⏭️ Skipping external link: {image_url[:60]}...")
                             _mark_seen(name, item.get('uri'), posted=False)
                             continue
-                    
+
                     print(f"   📤 Attempting reserve post: vault #{item['id']} - {item.get('text', '')[:40]}...")
-                    
+
                     res = tool_post_now(
                         vault_id=item['id'],
                         account_username=account_username,
                         account_id=account_id,
                         content_type=content_type,
                     )
-                    
+
                     print(f"      Result: success={res.get('success')}")
                     if not res.get('success'):
                         print(f"      Error: {res.get('error') or res.get('message')}")
-                    
+
                     if res.get('success'):
                         posted_from_reserve += 1
                         _mark_seen(name, item.get('uri'), posted=True)
                     else:
+                        # Mark as seen with posted=False so it won't be retried immediately
                         _mark_seen(name, item.get('uri'), posted=False)
         except Exception as e:
             print(f"   ❌ Reserve query error: {e}")
             traceback.print_exc()
 
     total = posted_new + posted_from_reserve
-    
+
     # Summary
     print(f"\n📊 Pipeline {name} summary:")
     print(f"   New posts: {posted_new}")
@@ -2949,11 +2939,11 @@ def _run_one_pipeline(cfg):
     else:
         msg = f"Fetched {len(fetched_posts)} into vault (no destination)"
         cfg['last_error'] = None
-    
+
     cfg['last_result'] = msg
     cfg['last_run_at'] = datetime.now()
     _save_auto_config(cfg)
-    
+
     print(f"🤖 Pipeline {name}: {msg}")
     return {"success": True, "posted": total, "message": msg}
 
