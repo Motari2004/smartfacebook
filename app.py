@@ -2578,38 +2578,42 @@ def tool_auto_setup(name='default', source_handle=None, account_username=None,
 
 
 def tool_auto_set_destination(name, account_username=None, account_id=None):
-    """Attach/update Facebook destination on an existing pipeline."""
+    """Smart destination setter - validates and stores correct account info"""
     if not name:
         return {"success": False, "error": "pipeline name required"}
+    
     resolved = _resolve_pipeline_name(name) or name
     cfg = _load_auto_config(resolved)
     if not cfg:
         return {"success": False, "error": f"Pipeline '{name}' not found"}
-    if not account_username and not account_id:
-        return {"success": False, "error": "account_username or account_id required"}
     
-    # If account_username is provided but no account_id, resolve it
-    if account_username and not account_id:
-        # Use resolve_facebook_account_id directly (bypass get_facebook_account_id)
-        account_id = resolve_facebook_account_id(account_username=account_username)
-        if not account_id:
-            return {"success": False, "error": f"Could not resolve account: {account_username}"}
+    # Smart validation
+    valid, validated_id, validated_username, error = validate_account_config(account_id, account_username)
     
-    # Store BOTH the username and the ID
-    cfg['account_username'] = account_username or cfg.get('account_username')
-    cfg['account_id'] = account_id or cfg.get('account_id')
-    cfg['last_result'] = f"destination set → @{cfg.get('account_username') or cfg.get('account_id')} (ID: {cfg.get('account_id')})"
+    if not valid:
+        return {
+            "success": False, 
+            "error": error,
+            "message": f"❌ {error}\n\nAvailable accounts:\n" + get_accounts_list()
+        }
+    
+    # Store the validated info
+    cfg['account_id'] = validated_id
+    cfg['account_username'] = validated_username
+    cfg['last_result'] = f"destination set → {validated_username} (ID: {validated_id})"
     
     if not _save_auto_config(cfg):
-        return {"success": False, "error": "Failed to save"}
+        return {"success": False, "error": "Failed to save config"}
     
     return {
         "success": True,
         "message": (
-            f"✅ Pipeline '{resolved}' destination: "
-            f"Facebook @{cfg.get('account_username') or cfg.get('account_id')} (ID: {cfg.get('account_id')})"
+            f"✅ Pipeline '{resolved}' destination:\n"
+            f"   Account: {validated_username}\n"
+            f"   Account ID: {validated_id}\n"
+            f"   Status: Verified ✓"
         ),
-        "config": cfg,
+        "config": cfg
     }
 
 
