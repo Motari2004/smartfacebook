@@ -2856,16 +2856,16 @@ def _run_one_pipeline(cfg):
             if conn:
                 cur = conn.cursor(cursor_factory=RealDictCursor)
 
-                # Keep fetching in batches until we post enough or run out of posts
+                # Keep fetching in batches of exactly 'remaining' posts until we post enough
                 offset = 0
-                batch_size = remaining * 3  # Get 3x what we need per batch
+                batch_size = remaining  # Fetch exactly what we need (2 posts)
                 max_batches = 10  # Safety limit to prevent infinite loops
                 batch_count = 0
                 total_checked = 0
                 
                 while posted_from_reserve < remaining and batch_count < max_batches:
                     batch_count += 1
-                    print(f"   🔍 Batch {batch_count}: Fetching up to {batch_size} reserve posts (offset {offset})")
+                    print(f"   🔍 Batch {batch_count}: Fetching {batch_size} reserve posts (offset {offset})")
                     
                     # Query with OFFSET to get next batch
                     cur.execute("""
@@ -2904,15 +2904,14 @@ def _run_one_pipeline(cfg):
                     
                     reserve = cur.fetchall()
                     total_checked += len(reserve)
-                    print(f"   📦 Found {len(reserve)} unposted posts in this batch (total checked: {total_checked})")
+                    print(f"   📦 Found {len(reserve)} posts in this batch (total checked: {total_checked})")
                     
                     # If no more posts, break out
                     if not reserve:
                         print(f"   📭 No more unposted posts in vault")
                         break
                     
-                    # Process this batch
-                    batch_posts_processed = 0
+                    # Try each post in this batch
                     for item in reserve:
                         # Check if we've posted enough
                         if posted_from_reserve >= remaining:
@@ -2943,7 +2942,6 @@ def _run_one_pipeline(cfg):
                             if any(domain in image_url.lower() for domain in external_domains):
                                 print(f"   ⏭️ Skipping external link: {image_url[:60]}...")
                                 _mark_seen(name, item.get('uri'), posted=False)
-                                batch_posts_processed += 1
                                 continue
                         
                         print(f"   📤 Attempting reserve post: vault #{item['id']} - {item.get('text', '')[:40]}...")
@@ -2967,18 +2965,11 @@ def _run_one_pipeline(cfg):
                             # Mark as seen with posted=False so it won't be retried immediately
                             _mark_seen(name, item.get('uri'), posted=False)
                             print(f"   ⏭️ Skipping failed post, continuing to next")
-                        
-                        batch_posts_processed += 1
                     
                     # Move offset forward
                     offset += batch_size
                     
-                    # If we processed fewer posts than batch_size, there might be more but we've hit limits
-                    if len(reserve) < batch_size:
-                        print(f"   📭 Reached end of available posts")
-                        break
-                    
-                    # If we haven't posted enough and have more posts to check, continue to next batch
+                    # If we haven't posted enough and there might be more posts, continue
                     if posted_from_reserve < remaining:
                         print(f"   🔄 Need {remaining - posted_from_reserve} more posts, fetching next batch...")
                 
